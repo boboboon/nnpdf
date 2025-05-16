@@ -6,7 +6,8 @@ import lhapdf
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import torch.nn.functional as F
+import torch.nn.functional as torch_func
+from loguru import logger
 from torch import nn
 from torch.optim import Adam
 from validphys.api import API
@@ -14,6 +15,7 @@ from validphys.fkparser import load_fktable
 from validphys.loader import Loader
 
 # %%
+# ? Load Commondata
 inp_p = {
     "dataset_input": {
         "dataset": "BCDMS_NC_NOTFIXED_P_EM-F2",
@@ -109,7 +111,7 @@ C_yy_j = C_yy + np.eye(C_yy.shape[0]) * eps
 Cinv = np.linalg.inv(C_yy_j)
 
 # %%
-
+# ? Prepare Tensors
 # your x-grid
 xgrid = fk_p.xgrid  # length 50
 x_torch = torch.tensor(xgrid, dtype=torch.float32).unsqueeze(1)
@@ -127,7 +129,10 @@ Cinv_torch = torch.tensor(Cinv, dtype=torch.float32)  # (N_data,N_data)
 
 # 1) Define the T3 network (same as in your earlier script)
 class T3Net(nn.Module):
-    def __init__(self, n_hidden: int, alpha: float, beta: float):
+    """Our T3 Network."""
+
+    def __init__(self, n_hidden: int, alpha: float, beta: float) -> None:
+        """Init for our network."""
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(1, n_hidden),
@@ -140,15 +145,17 @@ class T3Net(nn.Module):
         self.alpha = alpha
         self.beta = beta
 
-    def forward(self, x):
+    def forward(self, x: float) -> tuple:
+        """Forward Pass."""
         raw = self.net(x)  # (N_x,1)
-        positive = F.softplus(raw)  # ensure ≥0
+        positive = torch_func.softplus(raw)  # ensure ≥0
         pre = x.pow(1 - self.alpha) * (1 - x).pow(self.beta)
         return self.A * pre * positive  # (N_x,1)
 
 
 # 2) χ² loss function
-def chi2(model):
+def chi2(model) -> float:  # noqa: ANN001
+    """Calculate our Chi Squared."""
     f = model(x_torch).squeeze()  # (N_x,)
     y_pred = W_torch @ f  # (N_data,)
     resid = y_pred - y_torch  # (N_data,)
@@ -178,33 +185,20 @@ for epoch in range(1, 501):
     else:
         wait += 1
         if wait >= patience:
-            print(f"Early stopping at epoch {epoch}")
+            logger.info(f"Early stopping at epoch {epoch}")
             break
 
     if epoch % 50 == 0:
-        print(f"Epoch {epoch}: χ² = {val:.2f}")
+        logger.info(f"Epoch {epoch}: χ² = {val:.2f}")
 
 # %%
-# ? Evaluation
-# 4) Load best model & extract fit
+# ? Compare to reference PDF from LHAPDF
+
 model.load_state_dict(torch.load("t3_best.pt"))
 model.eval()
 with torch.no_grad():
     T3_fit = model(x_torch).squeeze().numpy()
 
-
-plt.loglog(xgrid, T3_fit, label="NN Fit of T3")
-plt.xlabel("x")
-plt.ylabel("T3(x)")
-plt.legend()
-plt.show()
-
-# %%
-# %%
-# Compare to reference PDF from LHAPDF
-
-
-# 1) Load the central NNPDF4.0 set
 pdfset = lhapdf.getPDFSet("NNPDF40_nnlo_as_01180")
 pdf0 = pdfset.mkPDF(0)  # central replica
 
@@ -229,10 +223,99 @@ plt.plot(xgrid, T3_ref, label="NNPDF4.0")
 plt.plot(xgrid, T3_fit, label="NN fit")
 plt.xlabel("x")
 plt.ylabel("T₃(x)")
-plt.yscale("log")
-plt.xscale("log")
 plt.legend()
 plt.show()
 
 
+# %%
+# 1) Data sanity: kinematic coverage & y‐distribution
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4))
+# (a) x vs Q2
+sc = ax1.scatter(
+    merged_df["x"],
+    merged_df["Q2"],
+    c=merged_df["y"],
+    cmap="coolwarm",
+    s=20,
+    alpha=0.8,
+)
+ax1.set(xscale="log", yscale="log", xlabel="x", ylabel="Q²", title="Data kinematics (F₂ₚ−F₂𝚍)")
+plt.colorbar(sc, ax=ax1, label="y = F₂ₚ−F₂𝚍")
+
+# (b) Histogram of y
+ax2.hist(merged_df["y"], bins=30, alpha=0.7)
+ax2.set(xlabel="y = F₂ₚ−F₂𝚍", ylabel="count", title="y distribution")
+plt.tight_layout()
+plt.show()
+
+# %%
+# 2) FK tables: heatmaps + coverage
+
+
+xgrid = fk_p.xgrid
+
+# (a) heatmaps of wp_t3, wd_t3, W
+fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+for ax, arr, title in zip(
+    axes,
+    [wp_t3, wd_t3, W],
+    ["proton T₃ kernels", "deuteron T₃ kernels", "difference W"],
+):
+    im = ax.imshow(
+        arr,
+        aspect="auto",
+        origin="lower",
+        extent=[xgrid[0], xgrid[-1], 0, arr.shape[0]],
+    )
+    ax.set(xlabel="x", title=title)
+    fig.colorbar(im, ax=ax)
+plt.tight_layout()
+plt.show()
+
+# (b) total coverage per x‐bin
+coverage = np.count_nonzero(W, axis=0)
+plt.figure(figsize=(6, 3))
+plt.semilogx(xgrid, coverage, "-o")
+plt.xlabel("x")
+plt.ylabel("# data rows with W≠0")
+plt.title("Sampling coverage of each x‐bin")
+plt.show()
+# %%
+# 3) PDF sanity: direct LHAPDF x·f and bare f
+
+
+pdfset = lhapdf.getPDFSet("NNPDF40_nnlo_as_01180")
+pdf0 = pdfset.mkPDF(0)
+Q0 = fk_p.Q0
+
+x = xgrid
+xf_up = np.array([pdf0.xfxQ(2, xi, Q0) for xi in x])
+xf_dn = np.array([pdf0.xfxQ(1, xi, Q0) for xi in x])
+# bare T3
+T3_bare = (xf_up - xf_dn) / x
+# x·T3
+T3_xf = xf_up - xf_dn
+
+plt.figure(figsize=(6, 4))
+plt.loglog(x, T3_xf, label="x·T₃ from LHAPDF")
+plt.loglog(x, T3_bare, "--", label="T₃ bare = (x·T₃)/x")
+plt.xlabel("x")
+plt.ylabel("T₃")
+plt.legend()
+plt.title("LHAPDF reference sanity")
+plt.show()
+# %%
+# 4) FK‐PDF convolution check: does W @ [x·T₃_ref] roughly reproduce y?
+y_ref = W @ T3_xf
+y_data = merged_df["y"].to_numpy()
+
+plt.figure(figsize=(5, 5))
+plt.scatter(y_ref, y_data, alpha=0.6, s=20)
+lims = [min(y_ref.min(), y_data.min()), max(y_ref.max(), y_data.max())]
+plt.plot(lims, lims, "k--")
+plt.xlabel("W·[x·T₃_ref]")
+plt.ylabel("y = data F₂ₚ−F₂𝚍")
+plt.title("FK convolution of LHAPDF vs data")
+plt.tight_layout()
+plt.show()
 # %%
