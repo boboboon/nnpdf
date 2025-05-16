@@ -1,132 +1,133 @@
 # %%
-"""T3 Script: toy NN fit of the non-singlet PDF T3."""
+"""T3 Script."""
 
-from pathlib import Path
-
+# 5) Quick plot
 import lhapdf
 import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
 import torch
-import torch.nn.functional as torch_f
-import yaml
-from loguru import logger
+import torch.nn.functional as F
 from torch import nn
+from torch.optim import Adam
+from validphys.api import API
 from validphys.fkparser import load_fktable
 from validphys.loader import Loader
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Reproducibility
-rng = np.random.default_rng(451)
-torch.manual_seed(1)
+# %%
+inp_p = {
+    "dataset_input": {
+        "dataset": "BCDMS_NC_NOTFIXED_P_EM-F2",
+        "variant": "legacy",
+    },
+    "use_cuts": "internal",
+    "theoryid": 200,
+}
+
+inp_d = {
+    "dataset_input": {
+        "dataset": "BCDMS_NC_NOTFIXED_D_EM-F2",
+        "variant": "legacy",
+    },
+    "use_cuts": "internal",
+    "theoryid": 200,
+}
 
 
-BASE_DIR = Path("nnpdf_data") / "nnpdf_data" / "commondata"
+lcd_p = API.loaded_commondata_with_cuts(**inp_p)
+lcd_d = API.loaded_commondata_with_cuts(**inp_d)
+
+df_p = lcd_p.commondata_table.rename(
+    columns={"kin1": "x", "kin2": "Q2", "kin3": "y", "data": "F2_p", "stat": "error"},
+)
+df_d = lcd_d.commondata_table.rename(
+    columns={"kin1": "x", "kin2": "Q2", "kin3": "y", "data": "F2_d", "stat": "error"},
+)
+
+df_p["idx_p"] = np.arange(len(df_p))  # 0 to 350
+df_d["idx_d"] = np.arange(len(df_d))
+
+
+# Match on x and Q2
+merged_df = df_p.merge(df_d, on=["x", "Q2"], suffixes=("_p", "_d"))
+merged_df["y"] = merged_df["F2_p"] - merged_df["F2_d"]
 
 
 # %%
-# ? Functions
-def load_commondata(dataset_folder: str, label: str) -> pd.DataFrame:
-    """Load the 'rqcd' data variant for proton or deuteron from YAML files.
+# ? Load FK Tables
+loader = Loader()
+fk_p = load_fktable(loader.check_fktable(setname="BCDMSP", theoryID=200, cfac=()))
+fk_d = load_fktable(loader.check_fktable(setname="BCDMSD", theoryID=200, cfac=()))
 
-    Parameters
-    ----------
-    dataset_folder : str
-        Name of the folder under commondata (e.g. "BCDMS_NC_NOTFIXED_P_EM-F2").
-    label : str
-        Column suffix for proton/deuteron, e.g. "p" or "d".
+# %%
+# ? Extract the Non-Singlet FK Kernel
+# Load the FK convolution kernels
+wp = fk_p.get_np_fktable()  # shape (351, 5, 50)
+wd = fk_d.get_np_fktable()  # shape (254, 5, 50)
 
-    Returns:
-    -------
-    pd.DataFrame
-        Columns:
-          - x, Q2 : kinematic points
-          - F2_{label} : central F2 values
-          - stat_{label}, sys_{label}, norm_{label} : absolute uncertainties
-    """
-    base = BASE_DIR / dataset_folder
+# Index of T₃ in the evolution basis
+flavor_index = 2  # T3 = u⁺ - d⁺
 
-    # 1) central values
-    with (base / "data_rqcd.yaml").open() as f:
-        central = yaml.safe_load(f)["data_central"]
+# Extract the T3 kernels for each dataset
+wp_t3 = wp[:, flavor_index, :]  # shape (351, 50)
+wd_t3 = wd[:, flavor_index, :]  # shape (254, 50)
 
-    # 2) kinematics
-    with (base / "kinematics_EM-F2-HEPDATA.yaml").open() as f:
-        kin = yaml.safe_load(f)["bins"]
-    xs = [b["x"]["mid"] for b in kin]
-    q2s = [b["Q2"]["mid"] for b in kin]
+# Get the matching FK row indices from the merged dataframe
+idx_p = merged_df["idx_p"].to_numpy()
+idx_d = merged_df["idx_d"].to_numpy()
 
-    # 3) uncertainties
-    with (base / "uncertainties_rqcd.yaml").open() as f:
-        unc = yaml.safe_load(f)["bins"]
-
-    return pd.DataFrame(
-        {
-            "x": xs,
-            "Q2": q2s,
-            f"F2_{label}": central,
-            f"stat_{label}": [u["stat"] for u in unc],
-            f"sys_{label}": [u["sys"] * v for u, v in zip(unc, central)],
-            f"norm_{label}": [u["norm"] * v for u, v in zip(unc, central)],
-        },
-    )
+# Subtract the proton and deuteron kernels: W = FK_p - FK_d
+W = wp_t3[idx_p] - wd_t3[idx_d]  # shape (N_matched, 50)
+# %%
+# ? Build the full covariance for p and d combined
+params = {
+    "dataset_inputs": [
+        {"dataset": "BCDMS_NC_NOTFIXED_P_EM-F2", "variant": "legacy"},
+        {"dataset": "BCDMS_NC_NOTFIXED_D_EM-F2", "variant": "legacy"},
+    ],
+    "use_cuts": "internal",
+    "theoryid": 200,
+}
+cov_full = API.dataset_inputs_covmat_from_systematics(**params)
 
 
-def compute_covariance(exp_df: pd.DataFrame) -> np.ndarray:
-    """Compute the combined covariance C_y = C_p + C_d for y = F2_p - F2_d.
+# Now extract only the rows+cols matching our merged_df.
+# The first block of cov_full corresponds to the proton points (0:len(df_p))
+# and the second to deuteron (len(df_p):len(df_p)+len(df_d)).
+n_p, n_d = len(df_p), len(df_d)
+# build index list: [ idx_p[i] ] and [ n_p + idx_d[i] ] for each merged row
+rows = np.concatenate([idx_p, n_p + idx_d])
+# but we want only the difference Fp-Fd, so we need the covariance of y = Fp - Fd:
+# Cov(y) = Cov(Fp,Fp)[idx_p,idx_p] + Cov(Fd,Fd)[idx_d,idx_d]
+#           -2 Cov(Fp,Fd)[idx_p, n_p+idx_d]
+C_pp = cov_full[:n_p, :n_p]
+C_dd = cov_full[n_p:, n_p:]
+C_pd = cov_full[:n_p, n_p:]
+C_yy = C_pp[np.ix_(idx_p, idx_p)] + C_dd[np.ix_(idx_d, idx_d)] - 2 * C_pd[np.ix_(idx_p, idx_d)]
 
-    Parameters
-    ----------
-    exp_df : pd.DataFrame
-        Must contain columns:
-        stat_p, sys_p, norm_p, stat_d, sys_d, norm_d
+eps = 1e-6 * np.mean(np.diag(C_yy))
+C_yy_j = C_yy + np.eye(C_yy.shape[0]) * eps
+Cinv = np.linalg.inv(C_yy_j)
 
-    Returns:
-    -------
-    C_y : np.ndarray
-        The (NxN) covariance matrix where N = len(exp_df).
-    """
-    # proton part
-    sp = exp_df["stat_p"].to_numpy()
-    xp = exp_df["sys_p"].to_numpy()
-    np_ = exp_df["norm_p"].to_numpy()
-    c_p = np.diag(sp**2) + np.outer(xp, xp) + np.outer(np_, np_)
+# %%
 
-    # deuteron part
-    sd = exp_df["stat_d"].to_numpy()
-    xd = exp_df["sys_d"].to_numpy()
-    nd = exp_df["norm_d"].to_numpy()
-    c_p = np.diag(sd**2) + np.outer(xd, xd) + np.outer(nd, nd)
+# your x-grid
+xgrid = fk_p.xgrid  # length 50
+x_torch = torch.tensor(xgrid, dtype=torch.float32).unsqueeze(1)
 
-    return c_p + c_p
+# data convolution matrix and target
+W_torch = torch.tensor(W, dtype=torch.float32)  # (N_data, 50)
+y_torch = torch.tensor(merged_df["y"].to_numpy(), dtype=torch.float32)  # (N_data,)
+
+# inverse covariance
+Cinv_torch = torch.tensor(Cinv, dtype=torch.float32)  # (N_data,N_data)
+
+# %%
+# ? Model Definition
 
 
+# 1) Define the T3 network (same as in your earlier script)
 class T3Net(nn.Module):
-    """Neural network parametrization of T3(x)=A x^{1-alpha}(1-x)^beta N(x).
-
-    Attributes:
-    ----------
-    net : nn.Sequential
-        The hidden layers (Linear + Tanh).
-    A : nn.Parameter
-        Overall normalization factor.
-    alpha : float
-        Small-x preprocessing exponent.
-    beta : float
-        Large-x preprocessing exponent.
-    """
-
-    def __init__(self, n_hidden: int, alpha: float, beta: float) -> None:
-        """Torch model."""
-        """Parameters
-        ----------
-        n_hidden : int
-            Number of neurons in each hidden layer.
-        alpha : float
-            Preprocessing exponent at small x.
-        beta : float
-            Preprocessing exponent at large x.
-        """
+    def __init__(self, n_hidden: int, alpha: float, beta: float):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(1, n_hidden),
@@ -139,199 +140,99 @@ class T3Net(nn.Module):
         self.alpha = alpha
         self.beta = beta
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Compute T3(x) on the grid.
-
-        Parameters
-        ----------
-        x : torch.Tensor
-            Shape (N_xgrid, 1)
-
-        Returns:
-        -------
-        torch.Tensor
-            Shape (N_xgrid, 1), the PDF values.
-        """
-        raw = self.net(x)  # shape (N,1)
-        positive = torch_f.softplus(raw)  # ≥0
+    def forward(self, x):
+        raw = self.net(x)  # (N_x,1)
+        positive = F.softplus(raw)  # ensure ≥0
         pre = x.pow(1 - self.alpha) * (1 - x).pow(self.beta)
-        return self.A * pre * positive
+        return self.A * pre * positive  # (N_x,1)
 
 
-def chi2(
-    model: T3Net,
-    w: torch.Tensor,
-    y: torch.Tensor,
-    c_inv: torch.Tensor,
-) -> torch.Tensor:
-    """Compute χ² = (W f - y)^T Cinv (W f - y).
-
-    Parameters
-    ----------
-    model : T3Net
-        The neural network instance.
-    W : torch.Tensor
-        FK kernel subset, shape (N_points, N_xgrid).
-    y : torch.Tensor
-        Data vector, shape (N_points,).
-    Cinv : torch.Tensor
-        Inverse covariance for those points, shape (N_points, N_points).
-
-    Returns:
-    -------
-    torch.Tensor
-        Scalar χ² value.
-    """
-    f = model(x_torch).squeeze()  # (N_xgrid,)
-    d = w @ f - y  # (N_points,)
-    return d @ (c_inv @ d)  # scalar
+# 2) χ² loss function
+def chi2(model):
+    f = model(x_torch).squeeze()  # (N_x,)
+    y_pred = W_torch @ f  # (N_data,)
+    resid = y_pred - y_torch  # (N_data,)
+    return resid @ (Cinv_torch @ resid)  # scalar
 
 
 # %%
-# ──────────────────────────────────────────────────────────────────────────────
-# 1) Load & merge data
-loader = Loader()
-df_p = (
-    load_commondata("BCDMS_NC_NOTFIXED_P", "p")
-    .reset_index(drop=True)
-    .reset_index()
-    .rename(columns={"index": "idx_p"})
-)
-df_d = (
-    load_commondata("BCDMS_NC_NOTFIXED_D", "d")
-    .reset_index(drop=True)
-    .reset_index()
-    .rename(columns={"index": "idx_d"})
-)
-exp_df = df_p.merge(df_d, on=["x", "Q2"], how="inner").assign(y=lambda d: d["F2_p"] - d["F2_d"])
-# %%
-# 2) Build full covariance & its inverse
-C_y = compute_covariance(exp_df)
-Cinv_np = np.linalg.inv(C_y)
-Cinv_t = torch.tensor(Cinv_np, dtype=torch.float32)
-# %%
-# 3) Extract non-singlet FK kernel & x-grid
-
-flavor_index = 2
-
-fk_p = load_fktable(loader.check_fktable(setname="BCDMSP", cfac=(), theoryID=200))
-fk_d = load_fktable(loader.check_fktable(setname="BCDMSD", cfac=(), theoryID=200))
-
-wp = fk_p.get_np_fktable()  # (N_p, 5, N_xgrid)
-wd = fk_d.get_np_fktable()  # (N_d, 5, N_xgrid)
-
-# ensure both share same x-grid
-x_p = fk_p.xgrid
-xgrid = x_p
-
-# select only the matched data rows
-idx_p = exp_df["idx_p"].to_numpy()
-idx_d = exp_df["idx_d"].to_numpy()
-wp_sel = wp[idx_p, flavor_index, :]
-wd_sel = wd[idx_d, flavor_index, :]
-w_ns = wp_sel - wd_sel
-
-W_t = torch.tensor(w_ns, dtype=torch.float32)
-# %%
-# 4) Pack data into torch
-x_torch = torch.tensor(xgrid, dtype=torch.float32).unsqueeze(1)  # (N_xgrid,1)
-y_torch = torch.tensor(exp_df["y"].to_numpy(), dtype=torch.float32)
-# %%
-# 5) Train/validation split
-N = len(exp_df)
-idx_all = np.arange(N)
-rng.shuffle(idx_all)
-n_val = int(0.2 * N)
-val_idx, train_idx = idx_all[:n_val], idx_all[n_val:]
-W_train, W_val = W_t[train_idx], W_t[val_idx]
-y_train, y_val = y_torch[train_idx], y_torch[val_idx]
-Cinv_train = Cinv_t[train_idx][:, train_idx]
-Cinv_val = Cinv_t[val_idx][:, val_idx]
-# %%
-# 6) Build model & optimizer
+# ? Training
+# 3) Instantiate & train
 model = T3Net(n_hidden=30, alpha=1.0, beta=3.0)
-opt = torch.optim.Adam(model.parameters(), lr=1e-3)
-best_val, wait, patience = float("inf"), 0, 10
-# %%
-# 7) Training loop with early stopping
+opt = Adam(model.parameters(), lr=1e-3)
+
+best = float("inf")
+patience, wait = 10, 0
+
 for epoch in range(1, 501):
     model.train()
     opt.zero_grad()
-    train_loss = chi2(model, W_train, y_train, Cinv_train)
-    train_loss.backward()
+    loss = chi2(model)
+    loss.backward()
     opt.step()
 
-    val_loss = chi2(model, W_val, y_val, Cinv_val).item()
-    if val_loss < best_val:
-        best_val, wait = val_loss, 0
-        torch.save(model.state_dict(), "best.pt")
+    val = loss.item()
+    if val < best:
+        best, wait = val, 0
+        torch.save(model.state_dict(), "t3_best.pt")
     else:
         wait += 1
         if wait >= patience:
-            logger.info(f"Early stopping at epoch {epoch}")
+            print(f"Early stopping at epoch {epoch}")
             break
 
     if epoch % 50 == 0:
-        logger.info(f"Epoch {epoch}: train χ²={train_loss:.2f}, val χ²={val_loss:.2f}")
+        print(f"Epoch {epoch}: χ² = {val:.2f}")
+
 # %%
-# 8) Load best model & plot fit
-model.load_state_dict(torch.load("best.pt"))
+# ? Evaluation
+# 4) Load best model & extract fit
+model.load_state_dict(torch.load("t3_best.pt"))
 model.eval()
 with torch.no_grad():
     T3_fit = model(x_torch).squeeze().numpy()
 
-plt.loglog(xgrid, T3_fit, label="NN fit")
+
+plt.loglog(xgrid, T3_fit, label="NN Fit of T3")
 plt.xlabel("x")
-plt.ylabel(r"$T_3(x)$")
+plt.ylabel("T3(x)")
 plt.legend()
 plt.show()
-# %%
-# 9) Monte Carlo replicas for uncertainty
-n_rep = 100
-T3_reps = np.zeros((n_rep, len(xgrid)))
-for r in range(n_rep):
-    y_rep = rng.multivariate_normal(exp_df["y"].to_numpy(), cov=C_y)
-    y_t = torch.tensor(y_rep, dtype=torch.float32)
-    model_r = T3Net(n_hidden=30, alpha=1.0, beta=3.0)
-    opt_r = torch.optim.Adam(model_r.parameters(), lr=1e-3)
-    # shorter training per replica
-    for _ in range(100):
-        opt_r.zero_grad()
-        loss_r = chi2(model_r, W_t, y_t, Cinv_t)
-        loss_r.backward()
-        opt_r.step()
-    with torch.no_grad():
-        T3_reps[r] = model_r(x_torch).squeeze().numpy()
 
-mean_t3 = T3_reps.mean(axis=0)
-std_t3 = T3_reps.std(axis=0)
-
-plt.fill_between(xgrid, mean_t3 - std_t3, mean_t3 + std_t3, alpha=0.3)
-plt.loglog(xgrid, mean_t3, label="mean ±1sigma")
-plt.xlabel("x")
-plt.ylabel(r"$T_3(x)$")
-plt.legend()
-plt.show()
 # %%
-# 10) Compare to reference PDF from LHAPDF
-pdf = lhapdf.getPDFSet("NNPDF40_nnlo_as_01180").mkPDF(0)
-Qref = 10.0
+# %%
+# Compare to reference PDF from LHAPDF
+
+
+# 1) Load the central NNPDF4.0 set
+pdfset = lhapdf.getPDFSet("NNPDF40_nnlo_as_01180")
+pdf0 = pdfset.mkPDF(0)  # central replica
+
+# 2) Pick a reference scale (must match your FK theoryID setup)
+Qref = fk_p.Q0  # GeV
+
+# 3) Compute T3_ref on your xgrid
 T3_ref = []
 for x in xgrid:
-    u = pdf.xfxQ(2, x, Qref) / x
-    ub = pdf.xfxQ(-2, x, Qref) / x
-    d = pdf.xfxQ(1, x, Qref) / x
-    db = pdf.xfxQ(-1, x, Qref) / x
+    # xfxQ(flavor_id, x, Q) returns x*f(x)
+    u = pdf0.xfxQ(2, x, Qref) / x  # up + anti-up
+    ub = pdf0.xfxQ(-2, x, Qref) / x
+    d = pdf0.xfxQ(1, x, Qref) / x  # down + anti-down
+    db = pdf0.xfxQ(-1, x, Qref) / x
     T3_ref.append((u + ub) - (d + db))
 T3_ref = np.array(T3_ref)
 
-plt.loglog(xgrid, T3_ref, label="Reference PDF")
-plt.loglog(xgrid, T3_fit, label="NN fit")
-plt.loglog(xgrid, mean_t3, label="Replica Mean")
-plt.fill_between(xgrid, mean_t3 - std_t3, mean_t3 + std_t3, alpha=0.3)
+
+# %%
+# ? Fit Plots
+plt.plot(xgrid, T3_ref, label="NNPDF4.0")
+plt.plot(xgrid, T3_fit, label="NN fit")
 plt.xlabel("x")
-plt.ylabel(r"$T_3(x)$")
+plt.ylabel("T₃(x)")
+plt.yscale("log")
+plt.xscale("log")
 plt.legend()
 plt.show()
+
 
 # %%
