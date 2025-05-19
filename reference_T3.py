@@ -1,299 +1,368 @@
-"""T3 Toy Model Fit Script
-Combines elements from the author’s GGI notebooks to:
-  1) Load prepared BCDMS Fₚ–F_d data
-  2) Define and train a PDF neural network
-  3) Perform replica fits and cross-validation
-  4) (Optional) Include a SMEFT Wilson coefficient parameter
+# %%
+"""ggi_1.ipynb."""
 
-Usage:
-  python t3_toy_model.py
-
-"""
-
+import lhapdf
 import matplotlib.pyplot as plt
 import numpy as np
-import torch
-import torch.nn.functional as F
-from torch import nn
-from torch.optim import Adam
+import tensorflow as tf
+from tensorflow import keras
+from validphys.api import API
+from validphys.fkparser import load_fktable
+from validphys.loader import Loader
 
 # %%
-# 1) Load prepared data
-# ---------------------
-# y: central values (F_p - F_d), shape (248,)
-# Cy: covariance matrix,        shape (248,248)
-# kin: kinematic points        shape (248,2)
-# FK: FK convolution table,    shape (248,50)
-# fk_grid: x-grid              shape (50,)
-# NNPDF40: reference PDF vector shape (n_replicas*50,)
+# ? Author Loadin
+# auth_data_path = "data/prepared_data/"
 
-data_path = "data/prepared_data/"
+# load data central values
+# data = np.load(auth_data_path + "data.npy")
 
-y = np.load(data_path + "data.npy")  # (248,)
-Cy = np.load(data_path + "Cy.npy")  # (248,248)
-kin = np.load(data_path + "kin.npy")  # (248,2)
-FK = np.load(data_path + "FK.npy")  # (248,50)
-xgrid = np.load(data_path + "fk_grid.npy")  # (50,)
-NNPDF40 = np.load(data_path + "NNPDF40.npy")  # (nreplicas*50,)
+# load data covariance matrix
+# Cy = np.load(auth_data_path + "Cy.npy")
 
-# slice out T3 reference from central replica
-T3_ref = NNPDF40[6 * 50 : 7 * 50]
+
+# FK = np.load(auth_data_path + "FK.npy")
+
+# load x-grid of the FK table
+# fk_grid = np.load(auth_data_path + "fk_grid.npy")
+
+# load results from NNPDF4.0. This is a vector containing the values of T_3 from
+# NNPDF4.0 on the x-grid loaded in the previous lines
+# f_ = np.load(auth_data_path + "NNPDF40.npy")
+
+# f = f_[6 * 50 : 7 * 50]
 
 # %%
-# 2) Kinematic coverage plot
-# ---------------------------
-plt.figure()
-plt.scatter(kin[:, 0], kin[:, 1] ** 2, marker="*", label="BCDMS F$_p$-F$_d$")
-plt.xscale("log")
-plt.yscale("log")
-plt.xlabel("x")
-plt.ylabel("Q$^2$ [GeV$^2$]")
+# ? Our copy
+
+# Load BCDMS F2_p, F2_d and form difference y = F2_p - F2_d
+inp_p = {
+    "dataset_input": {"dataset": "BCDMS_NC_NOTFIXED_P_EM-F2", "variant": "legacy"},
+    "use_cuts": "internal",
+    "theoryid": 200,
+}
+inp_d = {
+    "dataset_input": {"dataset": "BCDMS_NC_NOTFIXED_D_EM-F2", "variant": "legacy"},
+    "use_cuts": "internal",
+    "theoryid": 200,
+}
+
+lcd_p = API.loaded_commondata_with_cuts(**inp_p)
+lcd_d = API.loaded_commondata_with_cuts(**inp_d)
+
+df_p = lcd_p.commondata_table.rename(
+    columns={"kin1": "x", "kin2": "Q2", "kin3": "y", "data": "F2_p", "stat": "error"},
+)
+df_d = lcd_d.commondata_table.rename(
+    columns={"kin1": "x", "kin2": "Q2", "kin3": "y", "data": "F2_d", "stat": "error"},
+)
+
+df_p["idx_p"] = np.arange(len(df_p))
+df_d["idx_d"] = np.arange(len(df_d))
+
+
+mp = 0.938
+mp2 = mp**2
+
+merged_df = (
+    df_p.merge(df_d, on=["x", "Q2"], suffixes=("_p", "_d")).assign(
+        y=lambda df: df["F2_p"] - df["F2_d"],
+        W2=lambda df: df["Q2"] * (1 - df["x"]) / df["x"] + mp2,
+    )  # difference
+)
+
+# %% ---- FK Table Construction ----
+loader = Loader()
+fk_p = load_fktable(loader.check_fktable(setname="BCDMSP", theoryID=200, cfac=()))
+fk_d = load_fktable(loader.check_fktable(setname="BCDMSD", theoryID=200, cfac=()))
+
+wp = fk_p.get_np_fktable()
+wd = fk_d.get_np_fktable()
+flavor_index = 2  # T3 = u^+ - d^+
+
+wp_t3 = wp[:, flavor_index, :]
+wd_t3 = wd[:, flavor_index, :]
+idx_p = merged_df["idx_p"].to_numpy()
+idx_d = merged_df["idx_d"].to_numpy()
+W = wp_t3[idx_p] - wd_t3[idx_d]  # convolution matrix (N_data, N_grid)
+
+# %% ---- Covariance Matrix ----
+params = {
+    "dataset_inputs": [inp_p["dataset_input"], inp_d["dataset_input"]],
+    "use_cuts": "internal",
+    "theoryid": 200,
+}
+cov_full = API.dataset_inputs_covmat_from_systematics(**params)
+n_p, n_d = len(df_p), len(df_d)
+C_pp = cov_full[:n_p, :n_p]
+C_dd = cov_full[n_p:, n_p:]
+C_pd = cov_full[:n_p, n_p:]
+C_yy = C_pp[np.ix_(idx_p, idx_p)] + C_dd[np.ix_(idx_d, idx_d)] - 2 * C_pd[np.ix_(idx_p, idx_d)]
+
+
+# %% ---- x-grid & Tensors ----
+xgrid = fk_p.xgrid  # (N_grid,)
+
+
+# %% ---- Pseudo-data Generation ----
+pdfset = lhapdf.getPDFSet("NNPDF40_nnlo_as_01180")
+pdf0 = pdfset.mkPDF(0)
+Qref = fk_p.Q0
+T3_ref = []
+for x in xgrid:
+    u, ub = pdf0.xfxQ(2, x, Qref), pdf0.xfxQ(-2, x, Qref)
+    d, db = pdf0.xfxQ(1, x, Qref), pdf0.xfxQ(-1, x, Qref)
+    T3_ref.append((u + ub) - (d + db))
+T3_ref = np.array(T3_ref)  # true x*T3
+
+# %%
+
+# load data central values
+data = merged_df["y"].to_numpy()
+
+# load data covariance matrix
+Cy = C_yy
+
+FK = W
+
+# load x-grid of the FK table
+fk_grid = xgrid
+
+
+f = T3_ref
+
+
+# %%
+# compute theory prediction using NNPDF4.0 and compare them with the experimental data
+
+yth = FK @ f
+
+sigma = np.sqrt(np.diagonal(Cy)) / data
+x = np.arange(yth.size)
+ref = np.ones(yth.size)
+plt.figure(figsize=(20, 5))
+plt.errorbar(x, ref, np.abs(sigma), alpha=0.5, label="data")
+plt.scatter(x, yth, marker="*", c="red", label="theory predictions")
+plt.ylim([0.01, 2.5])
 plt.legend()
-plt.grid(True)
-plt.title("Kinematic Coverage")
-plt.show()
-
 # %%
-# 3) Invert covariance matrix
-# ----------------------------
-w, V = np.linalg.eigh(Cy)
-invCy = V @ np.diag(1.0 / w) @ V.T  # (248,248)
-
-# convert to torch tensors
-y_torch = torch.tensor(y, dtype=torch.float32)
-FK_torch = torch.tensor(FK, dtype=torch.float32)
-x_torch = torch.tensor(xgrid, dtype=torch.float32).unsqueeze(1)
-Cinv_torch = torch.tensor(invCy, dtype=torch.float32)
+# Neural Network
 
 
-# %%
-# 4) Network & Convolution definitions
-# -------------------------------------
-class PDF_NN(nn.Module):
-    """Simple feed-forward net for PDF values"""
+class Linear(keras.layers.Layer):
+    def __init__(self, units=32):
+        super().__init__()
+        self.units = units
 
+    def build(self, input_shape):
+        self.w = self.add_weight(
+            shape=(input_shape[-1], self.units),
+            initializer="random_normal",
+            trainable=True,
+        )
+        self.b = self.add_weight(
+            shape=(self.units,),
+            initializer="random_normal",
+            trainable=True,
+        )
+
+    def call(self, inputs):
+        return tf.matmul(inputs, self.w) + self.b
+
+
+# pdf layer
+class pdf_NN(keras.layers.Layer):
     def __init__(self):
         super().__init__()
-        self.l1 = nn.Linear(1, 64)
-        self.l2 = nn.Linear(64, 64)
-        self.l3 = nn.Linear(64, 32)
-        self.l4 = nn.Linear(32, 1)
+        self.linear_1 = Linear(64)
+        self.linear_2 = Linear(64)
+        self.linear_3 = Linear(32)
+        self.linear_4 = Linear(1)
 
-    def forward(self, x):
-        x = F.relu(self.l1(x))
-        x = F.relu(self.l2(x))
-        x = F.relu(self.l3(x))
-        return self.l4(x)  # (nx,1)
+    def call(self, inputs):
+        x = self.linear_1(inputs)
+        x = tf.nn.relu(x)
+        x = self.linear_2(x)
+        x = tf.nn.relu(x)
+        x = self.linear_3(x)
+        x = tf.nn.relu(x)
+        return self.linear_4(x)
 
 
-class ComputeConv(nn.Module):
-    """Convolution with precomputed FK table"""
-
-    def __init__(self, FK_np):
+# convolution layer
+class ComputeConv(keras.layers.Layer):
+    def __init__(self, FK):
         super().__init__()
-        self.FK = nn.Parameter(torch.tensor(FK_np, dtype=torch.float32), requires_grad=False)
+        self.fk = tf.Variable(
+            initial_value=tf.convert_to_tensor(FK, dtype="float32"),
+            trainable=False,
+        )
 
-    def forward(self, pdf_vals):
-        # FK: (ndata,nx), pdf_vals: (nx,1)
-        return (self.FK @ pdf_vals).squeeze(1)  # (ndata,)
+    def call(self, inputs):
+        res = tf.tensordot(self.fk, inputs, axes=1)
+        return res
 
 
-class Observable(nn.Module):
-    """Combines PDF_NN and ComputeConv"""
+# build the model
+class Observable(keras.Model):
+    """Combines the PDF and convolution into a model for training."""
 
-    def __init__(self, FK_np, include_smeft=False):
-        super().__init__()
-        self.pdf_net = PDF_NN()
-        self.conv = ComputeConv(FK_np)
-        # optional SMEFT Wilson coefficient (multiplicative)
-        if include_smeft:
-            self.c = nn.Parameter(torch.tensor(0.0))
-        else:
-            self.c = None
+    def __init__(
+        self,
+        FK,
+        name="dis",
+        **kwargs,
+    ):
+        super().__init__(name=name, **kwargs)
+        self.pdf = pdf_NN()
+        self.conv = ComputeConv(FK)
 
-    def forward(self, x):
-        pdf_vals = self.pdf_net(x)  # (nx,1)
-        y_pred = self.conv(pdf_vals)  # (ndata,)
-        if self.c is not None:
-            # toy SMEFT effect: scale prediction
-            y_pred = y_pred * (1.0 + self.c)
-        return y_pred
+    def get_pdf(self, inputs):
+        return self.pdf(inputs)
+
+    def call(self, inputs):
+        pdf_values = self.pdf(inputs)
+        obs = self.conv(pdf_values)
+        return obs
 
 
 # %%
-# 5) χ² loss function
-# -------------------
-def chi2_loss(y_true, y_pred, invC):
-    d = y_true - y_pred  # (ndata,)
-    chi2 = d @ (invC @ d)  # scalar
-    return chi2 / y_true.numel()
+# define an observable, giving as input the corresponding FK table
+thpred = Observable(FK)
+
+# the input x-values correspond to the x-points enetring the FK table.
+# For the following you need to reshape the input vector from (n,) to (n,1)
+x_input = fk_grid[:, np.newaxis]
+
+# the value of the observable as a function of the free parameters of the net
+# can be obatined as thpred(x_input). Try. What yoiu get is a set of values
+# corresponding to a random initialization of the net
+# thpred(x_input)
+
+# %%
+# Loss function
+
+
+def invert(Cy):
+    l, u = tf.linalg.eigh(Cy)
+    invCy = tf.cast(u @ tf.linalg.diag(1.0 / l) @ tf.transpose(u), "float32")
+    invCy = u @ tf.linalg.diag(1.0 / l) @ tf.transpose(u)
+    return tf.cast(invCy, "float32")
+
+
+def chi2(y, yth, invCy):
+    """Given a set of data with corrersponding th predictions and covariance matrix
+    returns the value of the chi2
+    """
+    d = y - yth
+    ndata = tf.cast(tf.size(y), "float32")
+    res = tf.tensordot(d, tf.tensordot(invCy, d, axes=1), axes=1) / ndata
+    return res
 
 
 # %%
-# 6) Single-model training
-# ------------------------
-model = Observable(FK, include_smeft=True)
-opt = Adam(model.parameters(), lr=1e-3)
+
+invCy = invert(Cy)
+chi2(data, thpred(x_input)[:, 0], invCy)
+
+x_input = fk_grid[:, np.newaxis]
+
+# output grid for the final pdf results
+grid_smallx = np.geomspace(1e-6, 0.1, 30)
+grid_largex = np.linspace(0.1, 1.0, 30)
+x_output = np.concatenate([grid_smallx, grid_largex])[:, np.newaxis]
+
+# define the model
+thpred = Observable(FK)
+
+# define the optimizer
+optimizer = tf.keras.optimizers.Adam(learning_rate=1e-3)
+
+# fix the numebr of epochs you want to use during the training
 epochs = 500
-patience = 10
-best_val = float("inf")
-wait = 0
-hist = []
 
-for epoch in range(1, epochs + 1):
-    model.train()
-    opt.zero_grad()
-    y_pred = model(x_torch)
-    loss = chi2_loss(y_torch, y_pred, Cinv_torch)
-    loss.backward()
-    opt.step()
+train_chi2 = []
+# implement the training loop
+for epoch in range(epochs):
+    with tf.GradientTape() as tape:
+        obs = thpred(x_input)
+        loss = chi2(data, obs[:, 0], invCy)
 
-    val = loss.item()
-    hist.append(val)
-    if val < best_val:
-        best_val, wait = val, 0
-        torch.save(model.state_dict(), "t3_best.pt")
+    # compute gradient wrt training parameters
+    grads = tape.gradient(loss, thpred.trainable_weights)
+    # update free parameters of the network
+    optimizer.apply_gradients(zip(grads, thpred.trainable_weights))
+    train_chi2.append(loss.numpy())
+
+# %%
+# now the model has been trained.
+# We can get the corresponding PDF and use the x_output grid to plot it.
+# We can plot NNPDF4.0 as well for reference.
+
+pdf_result = thpred.get_pdf(x_output)
+plt.plot(x_output, pdf_result.numpy(), c="green", alpha=0.5, label="fit")
+plt.plot(x_input, f / x_input[:, 0], "--", c="black", label="NNPDF4.0")
+plt.ylim([-1, 5])
+plt.legend()
+
+
+# %%
+# Solution Ex 3
+def plot_chi2_vs_epocs(chi2_res, epocs=500, label=r"$\chi^2$"):
+    x = np.arange(epocs)
+    plt.plot(x, chi2_res, label=label)
+    plt.legend()
+    # plt.show()
+
+
+plot_chi2_vs_epocs(train_chi2)
+# %%
+# Monte Carlo fit
+
+
+def fit_replica(y, Cy, invCy, epochs, noise=False):
+    thpred_NN = Observable(FK)
+    optimizer = tf.keras.optimizers.Adam(learning_rate=1e-3)
+
+    if noise:
+        yrep = tf.cast(np.random.multivariate_normal(y, Cy), "float32")
     else:
-        wait += 1
-        if wait >= patience:
-            print(f"Early stopping at epoch {epoch}")
-            break
-    if epoch % 50 == 0:
-        print(f"Epoch {epoch}: χ²/N = {val:.4f}")
+        yrep = tf.cast(y, "float32")
 
-# training history plot
-plt.figure()
-plt.plot(hist)
-plt.xlabel("Epoch")
-plt.ylabel("χ²/N")
-plt.title("Single-model Training")
-plt.show()
-
-# %%
-# 7) Replica fits
-# ----------------
-from copy import deepcopy
-
-
-def fit_replica(y, Cy, invC, FK_np, xgrid, epochs=500, noise=True):
-    # draw replica
-    y_rep = np.random.multivariate_normal(y, Cy) if noise else y.copy()
-    y_rep_t = torch.tensor(y_rep, dtype=torch.float32)
-    # new model instance
-    mdl = Observable(FK_np, include_smeft=False)
-    optim = Adam(mdl.parameters(), lr=1e-3)
-    history = []
-    for ep in range(epochs):
-        optim.zero_grad()
-        yp = mdl(torch.tensor(xgrid, dtype=torch.float32).unsqueeze(1))
-        loss = chi2_loss(y_rep_t, yp, torch.tensor(invC, dtype=torch.float32))
-        loss.backward()
-        optim.step()
-        history.append(loss.item())
-    return mdl, history
-
-
-n_replicas = 10
-replica_models = []
-replica_histories = []
-for i in range(n_replicas):
-    print(f"Fitting replica {i}")
-    mdl_i, hist_i = fit_replica(y, Cy, invCy, FK, xgrid)
-    replica_models.append(mdl_i)
-    replica_histories.append(hist_i)
-
-# plot replica training curves
-plt.figure()
-for h in replica_histories:
-    plt.plot(h, alpha=0.5)
-plt.xlabel("Epoch")
-plt.ylabel("χ²/N")
-plt.title("Replica Training")
-plt.show()
-
-# %%
-# 8) Cross-validation (Solution Ex 5)
-# ----------------------------------
-n_data = y.shape[0]
-idx = np.random.permutation(n_data)
-half = n_data // 2
-fitting_idx, test_idx = idx[:half], idx[half:]
-
-y_fit = y[fitting_idx]
-y_test = y[test_idx]
-Cy_fit = Cy[np.ix_(fitting_idx, fitting_idx)]
-Cy_test = Cy[np.ix_(test_idx, test_idx)]
-invC_fit = np.linalg.inv(Cy_fit)
-invC_test = np.linalg.inv(Cy_test)
-FK_fit = FK[fitting_idx]
-FK_test = FK[test_idx]
-
-# fit replicas on fitting set, record best epoch via look-back
-best_epochs = []
-best_models = []
-n_rep_cv = 20
-for rep in range(n_rep_cv):
-    print(f"CV replica {rep}")
-    # train on fitting set
-    mdl_cv = Observable(FK_fit, include_smeft=False)
-    optim = Adam(mdl_cv.parameters(), lr=1e-3)
-    train_losses, val_losses = [], []
-    # split fitting set into train/val 75/25
-    perm = np.random.permutation(len(fitting_idx))
-    split = int(0.75 * len(fitting_idx))
-    train_idx = perm[:split]
-    val_idx = perm[split:]
+    # Iterate over epochs.
+    train_chi2 = []
     for epoch in range(epochs):
-        # train step
-        optim.zero_grad()
-        yp_tr = mdl_cv(torch.tensor(xgrid, dtype=torch.float32).unsqueeze(1))
-        loss_tr = chi2_loss(
-            torch.tensor(y_fit, dtype=torch.float32),
-            yp_tr,
-            torch.tensor(invC_fit, dtype=torch.float32),
-        )
-        loss_tr.backward()
-        optim.step()
-        train_losses.append(loss_tr.item())
-        # validation
-        yp_val = mdl_cv(torch.tensor(xgrid, dtype=torch.float32).unsqueeze(1))
-        loss_val = chi2_loss(
-            torch.tensor(y_fit, dtype=torch.float32),
-            yp_val,
-            torch.tensor(invC_fit, dtype=torch.float32),
-        )
-        val_losses.append(loss_val.item())
-    # select best epoch on val
-    best_epoch = int(np.argmin(val_losses))
-    best_epochs.append(best_epoch)
-    # store model state
-    mdl_best = deepcopy(mdl_cv)
-    best_models.append(mdl_best)
+        with tf.GradientTape() as tape:
+            obs = thpred_NN(x_input)
+            loss = chi2(yrep, obs[:, 0], invCy)
 
-# histogram of best epochs
-plt.figure()
-plt.hist(best_epochs, bins=10)
-plt.xlabel("Best Epoch")
-plt.ylabel("Count")
-plt.title("Cross-Validation Best Epochs")
-plt.show()
+        grads = tape.gradient(loss, thpred_NN.trainable_weights)
+        optimizer.apply_gradients(zip(grads, thpred_NN.trainable_weights))
+        train_chi2.append(loss.numpy())
 
-# %%
-# 9) Evaluation on test set: bias and variance
-# --------------------------------------------
-y_th_reps = np.stack(
-    [
-        mdl.conv(mdl.pdf_net(torch.tensor(xgrid, dtype=torch.float32).unsqueeze(1)))
-        .detach()
-        .numpy()[test_idx]
-        for mdl in best_models
-    ],
-)
-y_th_avg = np.mean(y_th_reps, axis=0)
-bias = (y_th_avg - y_test) @ invC_test @ (y_th_avg - y_test)
-variance = np.mean(
-    [(y_th_reps[i] - y_th_avg) @ invC_test @ (y_th_reps[i] - y_th_avg) for i in range(n_rep_cv)],
-)
-print(f"Bias/N: {bias / variance:.3f}")
+    return thpred_NN.get_pdf(x_output), np.asarray(train_chi2)
+
+
+# run the fit
+replicas_res = []
+chi2_res = []
+
+invCy = invert(Cy)
+
+replicas = 10
+
+for rep in range(replicas):
+    print(f"fitting replica {rep}")
+    res_, chi2_ = fit_replica(data, Cy, invCy, 500, noise=True)
+    replicas_res.append(res_)
+    chi2_res.append(chi2_)
+
+# plot the results
+for i in range(replicas):
+    plt.plot(x_output, replicas_res[i].numpy() / x_output, c="green", alpha=0.5)
+plt.ylim([-1, 5])
+plt.xscale("log")
+plt.plot(x_input, f / x_input[:, 0], "--", c="black", label="NNPDF4.0")
+plt.legend()
 
 # %%

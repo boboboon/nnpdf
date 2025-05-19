@@ -25,7 +25,7 @@ auth_data_path = "data/prepared_data/"
 # -------------- #
 # 2. Load Both   #
 # -------------- #
-
+# %%
 # -- Author's processed data --
 y_auth = np.load(auth_data_path + "data.npy")
 Cy_auth = np.load(auth_data_path + "Cy.npy")
@@ -35,7 +35,7 @@ xgrid_auth = np.load(auth_data_path + "fk_grid.npy")
 NNPDF40_auth = np.load(auth_data_path + "NNPDF40.npy")
 
 T3_ref_auth = NNPDF40_auth[6 * 50 : 7 * 50]
-
+# %%
 # -- Our data (from validphys + LHAPDF pipeline) --
 inp_p = {
     "dataset_input": {"dataset": "BCDMS_NC_NOTFIXED_P_EM-F2", "variant": "legacy"},
@@ -60,6 +60,8 @@ df_d["idx_d"] = np.arange(len(df_d))
 merged_df = df_p.merge(df_d, on=["x", "Q2"], suffixes=("_p", "_d"))
 merged_df["y"] = merged_df["F2_p"] - merged_df["F2_d"]
 
+
+# %%
 # FK tables
 loader = Loader()
 fk_p = load_fktable(loader.check_fktable(setname="BCDMSP", theoryID=200, cfac=()))
@@ -72,7 +74,7 @@ wd_t3 = wd[:, flavor_index, :]
 idx_p = merged_df["idx_p"].to_numpy()
 idx_d = merged_df["idx_d"].to_numpy()
 W_our = wp_t3[idx_p] - wd_t3[idx_d]
-
+# %%
 # Covariance
 params = {
     "dataset_inputs": [
@@ -93,7 +95,7 @@ C_yy_j = C_yy + np.eye(C_yy.shape[0]) * eps
 
 xgrid_our = fk_p.xgrid
 y_our = merged_df["y"].to_numpy()
-
+# %%
 # -------------- #
 # 3. Pseudo-data #
 # -------------- #
@@ -116,7 +118,7 @@ T3_ref_our = np.array(T3_ref_our)
 np.random.seed(42)  # For reproducibility
 y_pseudo_mean = W_our @ T3_ref_our  # "theory" prediction
 y_pseudo = np.random.multivariate_normal(y_pseudo_mean, C_yy_j)
-
+# %%
 # ------------- #
 # 4. Comparison #
 # ------------- #
@@ -129,7 +131,7 @@ axs[1].scatter(merged_df["x"], merged_df["Q2"], c=y_our, cmap="coolwarm", s=15)
 axs[1].set(xscale="log", yscale="log", xlabel="x", ylabel="Q²", title="Ours: kinematics")
 sc = axs[2].scatter(merged_df["x"], merged_df["Q2"], c=y_pseudo, cmap="coolwarm", s=15)
 axs[2].set(xscale="log", yscale="log", xlabel="x", ylabel="Q²", title="Pseudo: kinematics")
-plt.colorbar(sc, ax=axs[2], label="F₂p−F₂d or pseudo-y")
+plt.colorbar(sc, ax=axs[2], label="F2p-F2d or pseudo-y")
 plt.tight_layout()
 plt.show()
 
@@ -139,11 +141,11 @@ plt.plot(y_auth, ".", label="Author", alpha=0.8)
 plt.plot(y_our, ".", label="Ours (real data)", alpha=0.8)
 plt.plot(y_pseudo, ".", label="Pseudo-data", alpha=0.7)
 plt.xlabel("Matched Data Index")
-plt.ylabel("F₂ₚ−F₂𝚍 or pseudo-y")
+plt.ylabel("F2p-F2d or pseudo-y")
 plt.title("Fp-Fd: Author vs Ours vs Pseudo")
 plt.legend()
 plt.show()
-
+# %%
 # == (3) Covariance: diagonal and full matrix ==
 plt.figure(figsize=(8, 4))
 plt.plot(np.diag(Cy_auth), label="Author diag(C)")
@@ -166,7 +168,7 @@ plt.colorbar()
 plt.suptitle("Covariance Matrices (full)")
 plt.tight_layout()
 plt.show()
-
+# %%
 # == (4) FK Table comparison ==
 plt.figure(figsize=(12, 5))
 plt.subplot(1, 2, 1)
@@ -180,7 +182,7 @@ plt.colorbar()
 plt.suptitle("FK Table Comparison")
 plt.tight_layout()
 plt.show()
-
+# %%
 # == Per-row correlation ==
 min_rows = min(FK_auth.shape[0], W_our.shape[0])
 corrs = [np.corrcoef(FK_auth[i], W_our[i])[0, 1] for i in range(min_rows)]
@@ -210,7 +212,7 @@ plt.ylabel("T₃(x)")
 plt.title("NNPDF T₃: Author vs Ours")
 plt.legend()
 plt.show()
-
+# %%
 # == (7) FK @ T3_ref convolution ==
 
 # (a) Author: y_pred = FK @ T3_ref_auth
