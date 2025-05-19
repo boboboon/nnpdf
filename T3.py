@@ -12,6 +12,7 @@ import numpy as np
 import torch
 import torch.nn.functional as torch_func
 from loguru import logger
+from matplotlib.lines import Line2D
 from torch import nn
 from torch.optim import Adam
 from validphys.api import API
@@ -27,12 +28,12 @@ plt.rc("font", family="serif")
 inp_p = {
     "dataset_input": {"dataset": "BCDMS_NC_NOTFIXED_P_EM-F2", "variant": "legacy"},
     "use_cuts": "internal",
-    "theoryid": 200,
+    "theoryid": 208,
 }
 inp_d = {
     "dataset_input": {"dataset": "BCDMS_NC_NOTFIXED_D_EM-F2", "variant": "legacy"},
     "use_cuts": "internal",
-    "theoryid": 200,
+    "theoryid": 208,
 }
 
 lcd_p = API.loaded_commondata_with_cuts(**inp_p)
@@ -48,16 +49,22 @@ df_d = lcd_d.commondata_table.rename(
 df_p["idx_p"] = np.arange(len(df_p))
 df_d["idx_d"] = np.arange(len(df_d))
 
+
+mp = 0.938
+mp2 = mp**2
+
 merged_df = (
     df_p.merge(df_d, on=["x", "Q2"], suffixes=("_p", "_d")).assign(
-        y=lambda df: df["F2_p"] - df["F2_d"],
+        y_val=lambda df: df["F2_p"] - df["F2_d"],
+        W2=lambda df: df["Q2"] * (1 - df["x"]) / df["x"] + mp2,
     )  # difference
 )
 
+
 # %% ---- FK Table Construction ----
 loader = Loader()
-fk_p = load_fktable(loader.check_fktable(setname="BCDMSP", theoryID=200, cfac=()))
-fk_d = load_fktable(loader.check_fktable(setname="BCDMSD", theoryID=200, cfac=()))
+fk_p = load_fktable(loader.check_fktable(setname="BCDMSP", theoryID=208, cfac=()))
+fk_d = load_fktable(loader.check_fktable(setname="BCDMSD", theoryID=208, cfac=()))
 
 wp = fk_p.get_np_fktable()
 wd = fk_d.get_np_fktable()
@@ -73,7 +80,7 @@ W = wp_t3[idx_p] - wd_t3[idx_d]  # convolution matrix (N_data, N_grid)
 params = {
     "dataset_inputs": [inp_p["dataset_input"], inp_d["dataset_input"]],
     "use_cuts": "internal",
-    "theoryid": 200,
+    "theoryid": 208,
 }
 cov_full = API.dataset_inputs_covmat_from_systematics(**params)
 n_p, n_d = len(df_p), len(df_d)
@@ -81,16 +88,28 @@ C_pp = cov_full[:n_p, :n_p]
 C_dd = cov_full[n_p:, n_p:]
 C_pd = cov_full[:n_p, n_p:]
 C_yy = C_pp[np.ix_(idx_p, idx_p)] + C_dd[np.ix_(idx_d, idx_d)] - 2 * C_pd[np.ix_(idx_p, idx_d)]
-# regularize
+
 eps = 1e-6 * np.mean(np.diag(C_yy))
-C_yy_j = C_yy + np.eye(C_yy.shape[0]) * eps
-Cinv = np.linalg.inv(C_yy_j)
+C_yy += np.eye(C_yy.shape[0]) * eps
+
+# now invert safely
+Cinv = np.linalg.inv(C_yy)
 
 # %% ---- x-grid & Tensors ----
 xgrid = fk_p.xgrid  # (N_grid,)
 x_torch = torch.tensor(xgrid, dtype=torch.float32).unsqueeze(1)
 W_torch = torch.tensor(W, dtype=torch.float32)
 Cinv_torch = torch.tensor(Cinv, dtype=torch.float32)
+# %%
+# x-bin coverage
+plt.figure(figsize=(5, 4))
+coverage = np.count_nonzero(W, axis=0)
+plt.semilogx(xgrid, coverage, "o-")
+plt.xlabel(r"$x$")
+plt.ylabel("Number of data contributing")
+plt.title("Data coverage per x-bin")
+plt.tight_layout()
+plt.show()
 
 # %% ---- Pseudo-data Generation ----
 pdfset = lhapdf.getPDFSet("NNPDF40_nnlo_as_01180")
@@ -106,12 +125,13 @@ T3_ref = np.array(T3_ref)  # true x*T3
 # mean and fluctuation
 rng = np.random.default_rng(42)
 y_pseudo_mean = W @ T3_ref
-y_pseudo = rng.multivariate_normal(y_pseudo_mean, C_yy_j)
+y_pseudo = rng.multivariate_normal(y_pseudo_mean, C_yy)
 
-y_raw = merged_df["y"].to_numpy()
+y_raw = merged_df["y_val"].to_numpy()
 
-y_torch = torch.tensor(y_raw, dtype=torch.float32)
+y_torch = torch.tensor(y_pseudo, dtype=torch.float32)
 
+# %%
 # Immediately show pseudo-data before fitting
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4))
 # kinematic coverage
@@ -130,15 +150,41 @@ ax2.set(xlabel=r"$y = F_2^p-F_2^d$", ylabel="Counts", title="Pseudo-data distrib
 plt.tight_layout()
 plt.show()
 
-# %% ---- FK convolution check ----
+
+# %% ---- FK convolution with x-colouring + distinct legend markers ----
+
 y_ref = W @ T3_ref
-plt.figure(figsize=(5, 5))
-plt.scatter(y_ref, y_pseudo, alpha=0.7)
-lims = [min(y_ref.min(), y_pseudo.min()), max(y_ref.max(), y_pseudo.max())]
-plt.plot(lims, lims, "k--")
-plt.xlabel(r"$y_\mathrm{ref}=W\cdot xT_3$")
-plt.ylabel(r"$y_\mathrm{pseudo}$")
-plt.title("FK convolution: pseudo vs theory")
+
+colour_vals = merged_df["W2"].to_numpy()
+
+fig, ax = plt.subplots(figsize=(6, 6))
+
+# 1) pseudo-data
+sc_pseudo = ax.scatter(y_ref, y_pseudo, color="C0", marker="o", alpha=0.6, label="Pseudo-data")
+
+# 2) real BCDMS data coloured by W2
+sc_real = ax.scatter(y_ref, y_raw, c=colour_vals, cmap="plasma", marker="s", s=50, alpha=0.8)
+cbar = fig.colorbar(sc_real, ax=ax, label=r"$W^2$ [GeV$^2$]")
+
+# 3) diagonal guide
+lims = [
+    min(y_ref.min(), y_pseudo.min(), y_raw.min()),
+    max(y_ref.max(), y_pseudo.max(), y_raw.max()),
+]
+ax.plot(lims, lims, "k--", label="Ideal")
+
+# 4) manual legend entries
+
+proxy_real = Line2D([], [], marker="s", color="gray", linestyle="None", label="Real BCDMS")
+ax.legend(handles=[sc_pseudo, proxy_real, Line2D([], [], linestyle="--", color="k")])
+
+proxy_ideal = Line2D([], [], linestyle="--", color="k", label="Ideal")
+ax.legend(handles=[sc_pseudo, proxy_real, proxy_ideal])
+
+
+ax.set_xlabel(r"$y_{\rm ref}=W\cdot xT_3$")
+ax.set_ylabel(r"$y$")
+ax.set_title("FK convolution: pseudo vs real data (coloured by $W^2$)")
 plt.tight_layout()
 plt.show()
 
@@ -197,7 +243,7 @@ for epoch in range(1, 501):
     # early stopping
     if val < best_loss:
         best_loss, wait = val, 0
-        torch.save(model.state_dict(), "t3_best.pt")
+        torch.save(model.state_dict(), "model_states/t3_best.pt")
     else:
         wait += 1
         if wait >= patience:
@@ -221,7 +267,7 @@ plt.tight_layout()
 plt.show()
 
 # %% ---- Final PDF Comparison ----
-model.load_state_dict(torch.load("t3_best.pt"))
+model.load_state_dict(torch.load("model_states/t3_best.pt"))
 model.eval()
 with torch.no_grad():
     T3_fit = model(x_torch).squeeze().numpy()
@@ -236,24 +282,75 @@ plt.legend()
 plt.tight_layout()
 plt.show()
 
-# %% ---- Coverage & Pull Distribution ----
-# x-bin coverage
-plt.figure(figsize=(5, 4))
-coverage = np.count_nonzero(W, axis=0)
-plt.semilogx(xgrid, coverage, "o-")
+
+# %% replica loop
+n_replicas = 20
+fits = []  # will hold T3_fit for each replica
+loss_per_replica = []  # optional: track final χ2 per replica
+
+for i in range(n_replicas):
+    # generate a new pseudo-dataset
+    y_pseudo = rng.multivariate_normal(y_pseudo_mean, C_yy)
+    y_torch = torch.tensor(y_pseudo, dtype=torch.float32)
+
+    # re-init model & optimizer
+    model = T3Net(n_hidden=30, alpha=1.0, beta=3.0)
+    optimizer = Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    best_loss = float("inf")
+    wait = 0
+
+    # train on this replica
+    for _ in range(1, 501):
+        model.train()
+        optimizer.zero_grad()
+        loss = chi2(model)
+        loss.backward()
+        optimizer.step()
+
+        val = loss.item()
+        if val < best_loss:
+            best_loss, wait = val, 0
+            torch.save(model.state_dict(), f"model_states/t3_replica{i}.pt")
+        else:
+            wait += 1
+            if wait >= patience:
+                break
+
+    loss_per_replica.append(best_loss)
+
+    # load best and eval
+    model.load_state_dict(torch.load(f"model_states/t3_replica{i}.pt"))
+    model.eval()
+    with torch.no_grad():
+        T3_fit = model(x_torch).squeeze().cpu().numpy()
+    fits.append(T3_fit)
+
+fits = np.array(fits)  # shape (n_replicas, N_grid)
+# %%
+# compute mean & std, and plot
+mean_fit = np.mean(fits, axis=0)
+std_fit = np.std(fits, axis=0)
+
+plt.figure(figsize=(6, 4))
+# uncertainty band
+plt.fill_between(
+    xgrid,
+    mean_fit - std_fit,
+    mean_fit + std_fit,
+    color="C1",
+    alpha=0.3,
+    label=r"NN fit ±1$\sigma$ (toy)",
+)
+# central fit
+plt.plot(xgrid, mean_fit, "-", label="NN fit mean")
+# truth
+plt.plot(xgrid, T3_ref, "--", label="NNPDF4.0 (truth)")
 plt.xlabel(r"$x$")
-plt.ylabel("Number of data contributing")
-plt.title("Data coverage per x-bin")
+plt.ylabel(r"$x\,T_3(x)$")
+plt.title(r"Closure-test ensemble: mean ± $\sigma$")
+plt.legend()
 plt.tight_layout()
 plt.show()
 
-# pull distribution
-resid = (y_pseudo - y_ref) / np.sqrt(np.diag(C_yy_j))
-plt.figure(figsize=(5, 4))
-plt.hist(resid, bins=30, alpha=0.7)
-plt.xlabel(r"Pull = $(y_\mathrm{pseudo}-y_\mathrm{ref})/\sigma$")
-plt.ylabel("Counts")
-plt.title("Pull distribution")
-plt.tight_layout()
-plt.show()
+
 # %%
