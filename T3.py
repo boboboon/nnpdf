@@ -6,6 +6,8 @@ W @ T3_ref (NNPDF4.0 central) plus correlated Gaussian noise.
 
 """
 
+from pathlib import Path
+
 import lhapdf
 import matplotlib.pyplot as plt
 import numpy as np
@@ -13,6 +15,7 @@ import torch
 import torch.nn.functional as torch_func
 from loguru import logger
 from matplotlib.lines import Line2D
+from sklearn.model_selection import train_test_split
 from torch import nn
 from torch.optim import Adam
 from validphys.api import API
@@ -22,6 +25,12 @@ from validphys.loader import Loader
 # --- Set matplotlib to use LaTeX for all text
 plt.rc("text", usetex=True)
 plt.rc("font", family="serif")
+
+images_dir = Path("images")
+images_dir.mkdir(exist_ok=True)
+
+model_state_dir = Path("model_states")
+model_state_dir.mkdir(exist_ok=True)
 
 # %% ---- Data Preparation ----
 # Load BCDMS F2_p, F2_d and form difference y = F2_p - F2_d
@@ -59,6 +68,30 @@ merged_df = (
         W2=lambda df: df["Q2"] * (1 - df["x"]) / df["x"] + mp2,
     )  # difference
 )
+# %% ---- Raw BCDMS F2 (x vs Q² heatmap) ----
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5), sharex=True, sharey=True)
+
+# Proton
+sc1 = ax1.scatter(df_p["x"], df_p["Q2"], c=df_p["F2_p"], cmap="viridis", s=25, alpha=0.8)
+ax1.set_xscale("log")
+ax1.set_yscale("log")
+ax1.set_xlabel(r"$x$")
+ax1.set_ylabel(r"$Q^2\,[\mathrm{GeV}^2]$")
+ax1.set_title(r"BCDMS $F_2^p$")
+plt.colorbar(sc1, ax=ax1, label=r"$F_2^p$")
+
+# Deuteron
+sc2 = ax2.scatter(df_d["x"], df_d["Q2"], c=df_d["F2_d"], cmap="plasma", s=25, alpha=0.8)
+ax2.set_xscale("log")
+ax2.set_yscale("log")
+ax2.set_xlabel(r"$x$")
+ax2.set_title(r"BCDMS $F_2^d$")
+plt.colorbar(sc2, ax=ax2, label=r"$F_2^d$")
+
+fig.suptitle("Raw BCDMS DIS Data: Proton and Deuteron", y=1.02)
+fig.tight_layout()
+fig.savefig(images_dir / "raw_F2p_F2d_heatmap.png", dpi=300)
+plt.show()
 
 
 # %% ---- FK Table Construction ----
@@ -100,6 +133,8 @@ xgrid = fk_p.xgrid  # (N_grid,)
 x_torch = torch.tensor(xgrid, dtype=torch.float32).unsqueeze(1)
 W_torch = torch.tensor(W, dtype=torch.float32)
 Cinv_torch = torch.tensor(Cinv, dtype=torch.float32)
+
+
 # %%
 # x-bin coverage
 plt.figure(figsize=(5, 4))
@@ -123,7 +158,8 @@ for x in xgrid:
 T3_ref = np.array(T3_ref)  # true x*T3
 
 # mean and fluctuation
-rng = np.random.default_rng(42)
+base_seed = 42
+rng = np.random.default_rng(base_seed)
 y_pseudo_mean = W @ T3_ref
 y_pseudo = rng.multivariate_normal(y_pseudo_mean, C_yy)
 
@@ -147,7 +183,8 @@ plt.colorbar(sc, ax=ax1, label=r"$y_\mathrm{pseudo}$")
 # distribution of y
 ax2.hist(y_pseudo, bins=30, alpha=0.7)
 ax2.set(xlabel=r"$y = F_2^p-F_2^d$", ylabel="Counts", title="Pseudo-data distribution")
-plt.tight_layout()
+fig.tight_layout()
+fig.savefig(images_dir / "pseudo_data_kinematics_and_distribution.png", dpi=300)
 plt.show()
 
 
@@ -176,8 +213,6 @@ ax.plot(lims, lims, "k--", label="Ideal")
 # 4) manual legend entries
 
 proxy_real = Line2D([], [], marker="s", color="gray", linestyle="None", label="Real BCDMS")
-ax.legend(handles=[sc_pseudo, proxy_real, Line2D([], [], linestyle="--", color="k")])
-
 proxy_ideal = Line2D([], [], linestyle="--", color="k", label="Ideal")
 ax.legend(handles=[sc_pseudo, proxy_real, proxy_ideal])
 
@@ -185,169 +220,249 @@ ax.legend(handles=[sc_pseudo, proxy_real, proxy_ideal])
 ax.set_xlabel(r"$y_{\rm ref}=W\cdot xT_3$")
 ax.set_ylabel(r"$y$")
 ax.set_title("FK convolution: pseudo vs real data (coloured by $W^2$)")
-plt.tight_layout()
+fig.tight_layout()
+fig.savefig(images_dir / "fk_convolution_pseudo_vs_real.png", dpi=300)
 plt.show()
 
 
 # %% ---- Model Definition ----
 class T3Net(nn.Module):
-    """Neural network for non-singlet PDF, outputs x*T3(x)."""
+    """Neural network for non-singlet PDF, outputs x*T3(x) with extra flexibility."""
 
-    def __init__(self, n_hidden: int, alpha: float, beta: float) -> None:
-        """Init."""
+    def __init__(
+        self,
+        n_hidden: int,
+        n_layers: int = 3,
+        alpha: float = 1.0,
+        beta: float = 3.0,
+        dropout: float = 0.1,
+    ) -> None:
+        """Parameters.
+
+        ----------
+        n_hidden : int
+            Number of units per hidden layer.
+        n_layers : int
+            Total number of hidden layers.
+        alpha : float
+            Initial small-x exponent.
+        beta : float
+            Initial large-x exponent.
+        dropout : float
+            Dropout probability between layers.
+        """
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(1, n_hidden),
-            nn.Tanh(),
-            nn.Linear(n_hidden, n_hidden),
-            nn.Tanh(),
-            nn.Linear(n_hidden, 1),
-        )
+
+        layers: list[nn.Module] = []
+        # input layer
+        layers.append(nn.Linear(1, n_hidden))
+        layers.append(nn.Tanh())
+        layers.append(nn.BatchNorm1d(n_hidden))
+
+        # hidden blocks
+        for _ in range(n_layers - 1):
+            layers.append(nn.Linear(n_hidden, n_hidden))
+            layers.append(nn.Tanh())
+            layers.append(nn.BatchNorm1d(n_hidden))
+            layers.append(nn.Dropout(dropout))
+
+        # output block
+        layers.append(nn.Linear(n_hidden, 1))
+
+        self.net = nn.Sequential(*layers)
+
+        # overall normalization
         self.A = nn.Parameter(torch.tensor(1.0))
-        self.alpha = alpha
-        self.beta = beta
+
+        # make exponents trainable
+        self.alpha = nn.Parameter(torch.tensor(alpha))
+        self.beta = nn.Parameter(torch.tensor(beta))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward Pass."""
+        """Forward Pass.
+
+        computes A * x^alpha (1+x)^beta * softplus( NN(x) ).
+        """
         raw = self.net(x)
         pos = torch_func.softplus(raw)
-        pre = x.pow(1 - self.alpha) * (1 - x).pow(self.beta)
+        pre = x.pow(self.alpha) * (1.0 - x).pow(self.beta)
         return self.A * pre * pos
 
 
-def chi2(model: nn.Module) -> torch.Tensor:
-    """Loss."""
-    f_pred = model(x_torch).squeeze()
-    y_pred = W_torch @ f_pred
-    resid = y_pred - y_torch
-    return (resid @ (Cinv_torch @ resid)) / resid.size(0)
+# %% ---- Replica Loop with Post-Fit Validation & Discarding ----
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+patience, wait = 250, 0
+num_epochs = 2000
+n_replicas = 100
+
+lambda_sum, lambda_pos = 100.0, 10.0
 
 
-# %% ---- Training Loop ----
-model = T3Net(n_hidden=30, alpha=1.0, beta=3.0)
-optimizer = Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
-best_loss = float("inf")
-patience, wait = 10, 0
-loss_hist, chi2_hist = [], []
-
-for epoch in range(1, 501):
-    model.train()
-    optimizer.zero_grad()
-    loss = chi2(model)
-    loss.backward()
-    optimizer.step()
-    val = loss.item()
-    loss_hist.append(val)
-    chi2_hist.append(val / len(y_torch))
-
-    # early stopping
-    if val < best_loss:
-        best_loss, wait = val, 0
-        torch.save(model.state_dict(), "model_states/t3_best.pt")
-    else:
-        wait += 1
-        if wait >= patience:
-            logger.info(f"Early stopping at epoch {epoch}")
-            break
-
-    if epoch % 50 == 0:
-        logger.info(rf"Epoch {epoch}: \chi^2 = {val:.2f}")
-
-# %% ---- Loss Curves ----
-fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-axes[0].plot(loss_hist, label=r"Total $\chi^2$")
-axes[0].set(xlabel="Epoch", ylabel=r"$\chi^2$", title="Training loss")
-axes[0].legend()
-
-axes[1].plot(chi2_hist, label=r"$\chi^2/N$")
-axes[1].set(xlabel="Epoch", ylabel=r"$\chi^2/N$", title="Reduced chi2")
-axes[1].legend()
-
-plt.tight_layout()
-plt.show()
-
-# %% ---- Final PDF Comparison ----
-model.load_state_dict(torch.load("model_states/t3_best.pt"))
-model.eval()
-with torch.no_grad():
-    T3_fit = model(x_torch).squeeze().numpy()
-
-plt.figure(figsize=(6, 4))
-plt.plot(xgrid, T3_ref, label=r"NNPDF4.0 (truth, $xT_3$)")
-plt.plot(xgrid, T3_fit, "--", label=r"NN fit")
-plt.xlabel(r"$x$")
-plt.ylabel(r"$x\,T_3(x)$")
-plt.title(r"Closure test: fitted vs true $xT_3$")
-plt.legend()
-plt.tight_layout()
-plt.show()
-
-
-# %% replica loop
-n_replicas = 20
-fits = []  # will hold T3_fit for each replica
-loss_per_replica = []  # optional: track final χ2 per replica
+fits = []  # accepted fits
+loss_per_replica = []  # validation χ²_phys for accepted replicas
+discarded = []  # indices of discarded replicas
+train_histories = []  # train-loss histories
+val_histories = []  # val-loss histories
 
 for i in range(n_replicas):
-    # generate a new pseudo-dataset
-    y_pseudo = rng.multivariate_normal(y_pseudo_mean, C_yy)
-    y_torch = torch.tensor(y_pseudo, dtype=torch.float32)
+    # 1) Generate pseudo-data for this replica
+    rng_rep = np.random.default_rng(base_seed + i)
+    y_pseudo = rng_rep.multivariate_normal(y_pseudo_mean, C_yy)
+    y_torch_rep = torch.tensor(y_pseudo, dtype=torch.float32).to(device)
 
-    # re-init model & optimizer
-    model = T3Net(n_hidden=30, alpha=1.0, beta=3.0)
-    optimizer = Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
-    best_loss = float("inf")
-    wait = 0
+    # 2) Train/validation split
+    idx = np.arange(W_torch.size(0))
+    train_idx, val_idx = train_test_split(idx, test_size=0.2, random_state=base_seed + i)
 
-    # train on this replica
-    for _ in range(1, 501):
-        model.train()
-        optimizer.zero_grad()
-        loss = chi2(model)
-        loss.backward()
-        optimizer.step()
+    # 3) Build & invert sub-covariances
+    C_tr = C_yy[np.ix_(train_idx, train_idx)]
+    C_val = C_yy[np.ix_(val_idx, val_idx)]
+    eps_tr = 1e-6 * np.mean(np.diag(C_tr))
+    eps_val = 1e-6 * np.mean(np.diag(C_val))
+    C_tr += np.eye(len(train_idx)) * eps_tr
+    C_val += np.eye(len(val_idx)) * eps_val
+    Cinv_tr = torch.tensor(np.linalg.inv(C_tr), dtype=torch.float32).to(device)
+    Cinv_val = torch.tensor(np.linalg.inv(C_val), dtype=torch.float32).to(device)
 
-        val = loss.item()
-        if val < best_loss:
-            best_loss, wait = val, 0
-            torch.save(model.state_dict(), f"model_states/t3_replica{i}.pt")
+    # thresholds
+    chi2_tol = 1.5 * len(val_idx)
+    sum_tol = 0.5
+    neg_tol = 1e-5
+
+    # 4) Initialize model & optimizer
+    model_rep = T3Net(n_hidden=100, n_layers=15, alpha=0.5, beta=5.0, dropout=0.2).to(device)
+    opt_rep = Adam(model_rep.parameters(), lr=1e-3, weight_decay=1e-4)
+
+    # 5) Train/Val loop with early stopping on validation loss
+    train_loss, val_loss = [], []
+    best_val, wait = float("inf"), 0
+
+    for epoch in range(1, num_epochs + 1):
+        # a) Train step
+        model_rep.train()
+        opt_rep.zero_grad()
+        f_pred = model_rep(x_torch).squeeze()
+        resid_tr = (W_torch[train_idx] @ f_pred) - y_torch_rep[train_idx]
+        loss_tr = resid_tr @ (Cinv_tr @ resid_tr)
+        # physics penalties
+        x = x_torch.squeeze()
+        t3 = f_pred / x
+        loss_tr += lambda_sum * (torch.trapz(t3, x) - 1.0) ** 2
+        loss_tr += lambda_pos * torch.sum(torch.relu(-t3) ** 2)
+        loss_tr.backward()
+        opt_rep.step()
+        train_loss.append(loss_tr.item())
+
+        # b) Validation step
+        model_rep.eval()
+        with torch.no_grad():
+            resid_val = (W_torch[val_idx] @ f_pred) - y_torch_rep[val_idx]
+            loss_val = resid_val @ (Cinv_val @ resid_val)
+            loss_val += lambda_sum * (torch.trapz(t3, x) - 1.0) ** 2
+            loss_val += lambda_pos * torch.sum(torch.relu(-t3) ** 2)
+        val_loss.append(loss_val.item())
+
+        # c) Early stop on validation
+        if loss_val.item() < best_val:
+            best_val, wait = loss_val.item(), 0
+            torch.save(model_rep.state_dict(), model_state_dir / f"t3_replica{i}.pt")
         else:
             wait += 1
             if wait >= patience:
+                logger.info(f"Replica {i}: early stop at epoch {epoch}")
                 break
 
-    loss_per_replica.append(best_loss)
+    train_histories.append(train_loss)
+    val_histories.append(val_loss)
 
-    # load best and eval
-    model.load_state_dict(torch.load(f"model_states/t3_replica{i}.pt"))
-    model.eval()
+    # 6) Post-fit validation
+    model_rep.load_state_dict(torch.load(model_state_dir / f"t3_replica{i}.pt"))
+    model_rep.eval()
     with torch.no_grad():
-        T3_fit = model(x_torch).squeeze().cpu().numpy()
-    fits.append(T3_fit)
+        f_best = model_rep(x_torch).squeeze()
+        resid_val = (W_torch[val_idx] @ f_best) - y_torch_rep[val_idx]
+        chi2_val = float(resid_val @ (Cinv_val @ resid_val))
+        T3_vals = (f_best / x).cpu()
+        sum_dev = abs(torch.trapz(T3_vals, x.cpu()).item() - 1.0)
+        neg_max = float((-T3_vals.clamp_max(0.0)).max().item())
 
-fits = np.array(fits)  # shape (n_replicas, N_grid)
-# %%
-# compute mean & std, and plot
-mean_fit = np.mean(fits, axis=0)
-std_fit = np.std(fits, axis=0)
+    if chi2_val <= chi2_tol and sum_dev <= sum_tol and neg_max <= neg_tol:
+        fits.append(f_best.cpu().numpy())
+        loss_per_replica.append(chi2_val)
+        logger.success(
+            f"Replica {i} kept: χ²={chi2_val:.1f}, sum_dev={sum_dev:.2e}, neg_max={neg_max:.2e}",
+        )
+    else:
+        discarded.append(i)
+        logger.warning(
+            f"Replica {i} discard: χ²={chi2_val:.1f}, sum_dev={sum_dev:.2e}, neg_max={neg_max:.2e}",
+        )
+
+# Convert accepted fits to array
+fits = np.array(fits)
+logger.info(f"Kept {fits.shape[0]} / {n_replicas} replicas; discarded {len(discarded)}.")
+
+# %% ---- Plot Accepted Replica Ensemble vs. Truth ----
+mean_fit = fits.mean(axis=0)
+std_fit = fits.std(axis=0)
 
 plt.figure(figsize=(6, 4))
-# uncertainty band
 plt.fill_between(
     xgrid,
     mean_fit - std_fit,
     mean_fit + std_fit,
     color="C1",
     alpha=0.3,
-    label=r"NN fit ±1$\sigma$ (toy)",
+    label=r"Accepted ensemble ±1$\sigma$",
 )
-# central fit
-plt.plot(xgrid, mean_fit, "-", label="NN fit mean")
-# truth
-plt.plot(xgrid, T3_ref, "--", label="NNPDF4.0 (truth)")
+plt.plot(xgrid, mean_fit, "-", label="Accepted mean")
+plt.plot(xgrid, T3_ref, "--", label="Truth (NNPDF4.0)")
 plt.xlabel(r"$x$")
 plt.ylabel(r"$x\,T_3(x)$")
-plt.title(r"Closure-test ensemble: mean ± $\sigma$")
+plt.title("Accepted Replica Ensemble vs. Truth")
+plt.legend()
+plt.tight_layout()
+plt.savefig(images_dir / "accepted_replica_vs_truth.png", dpi=300)
+plt.show()
+
+# %% ---- Plot Train/Val Loss (Last Accepted Replica) ----
+plt.figure(figsize=(6, 4))
+plt.plot(train_histories[-1], label="Train loss")
+plt.plot(val_histories[-1], label="Val   loss")
+plt.xlabel("Epoch")
+plt.ylabel(r"$\chi^2_{\rm phys}$")
+plt.title("Train vs. Validation Loss (Last Accepted Replica)")
+plt.legend()
+plt.tight_layout()
+plt.savefig(images_dir / "train_val_loss_last_accepted.png", dpi=300)
+plt.show()
+
+
+# %% ---- PDF Correlation Matrix Heatmap ----
+cov_pdf = np.cov(fits, rowvar=False)
+corr_pdf = cov_pdf / np.sqrt(np.outer(np.diag(cov_pdf), np.diag(cov_pdf)))
+plt.figure(figsize=(6, 5))
+plt.imshow(corr_pdf, origin="lower", aspect="auto", vmin=-1, vmax=1)
+plt.colorbar(label="Correlation")
+plt.xlabel("x-bin index")
+plt.ylabel("x-bin index")
+plt.title("PDF Correlation Matrix")
+plt.tight_layout()
+plt.show()
+# %% ---- Principal Components of PDF Uncertainty ----
+eigvals, eigvecs = np.linalg.eigh(cov_pdf)
+idx = np.argsort(eigvals)[::-1]
+eigvals, eigvecs = eigvals[idx], eigvecs[:, idx]
+
+# plot first 3 eigen-modes
+plt.figure(figsize=(6, 4))
+for j in range(3):
+    plt.plot(xgrid, eigvecs[:, j], label=f"PC{j + 1} ({eigvals[j]:.2e})")
+plt.xlabel(r"$x$")
+plt.ylabel("Eigenvector")
+plt.title("Leading Principal Components of PDF Covariance")
 plt.legend()
 plt.tight_layout()
 plt.show()
