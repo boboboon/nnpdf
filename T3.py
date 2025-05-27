@@ -120,12 +120,27 @@ n_p, n_d = len(df_p), len(df_d)
 C_pp = cov_full[:n_p, :n_p]
 C_dd = cov_full[n_p:, n_p:]
 C_pd = cov_full[:n_p, n_p:]
+
+# build the y = p - d combination
 C_yy = C_pp[np.ix_(idx_p, idx_p)] + C_dd[np.ix_(idx_d, idx_d)] - 2 * C_pd[np.ix_(idx_p, idx_d)]
 
-eps = 1e-6 * np.mean(np.diag(C_yy))
-C_yy += np.eye(C_yy.shape[0]) * eps
+# 1) Symmetrize
+C_yy = 0.5 * (C_yy + C_yy.T)
 
-# now invert safely
+# 2) Add jitter until positive definite
+jitter = 1e-6 * np.mean(np.diag(C_yy))
+for _ in range(10):
+    try:
+        np.linalg.cholesky(C_yy)
+        break
+    except np.linalg.LinAlgError:
+        C_yy += np.eye(C_yy.shape[0]) * jitter
+        jitter *= 10
+else:
+    msg = "Covariance matrix is not positive-definite even after jitter."
+    raise RuntimeError(msg)
+
+# now safely invert
 Cinv = np.linalg.inv(C_yy)
 
 # %% ---- x-grid & Tensors ----
@@ -190,23 +205,36 @@ plt.show()
 
 # %% ---- FK convolution with x-colouring + distinct legend markers ----
 
-y_ref = W @ T3_ref
-
 colour_vals = merged_df["W2"].to_numpy()
 
 fig, ax = plt.subplots(figsize=(6, 6))
 
 # 1) pseudo-data
-sc_pseudo = ax.scatter(y_ref, y_pseudo, color="C0", marker="o", alpha=0.6, label="Pseudo-data")
+sc_pseudo = ax.scatter(
+    y_pseudo_mean,
+    y_pseudo,
+    color="C0",
+    marker="o",
+    alpha=0.6,
+    label="Pseudo-data",
+)
 
 # 2) real BCDMS data coloured by W2
-sc_real = ax.scatter(y_ref, y_raw, c=colour_vals, cmap="plasma", marker="s", s=50, alpha=0.8)
+sc_real = ax.scatter(
+    y_pseudo_mean,
+    y_raw,
+    c=colour_vals,
+    cmap="plasma",
+    marker="s",
+    s=50,
+    alpha=0.8,
+)
 cbar = fig.colorbar(sc_real, ax=ax, label=r"$W^2$ [GeV$^2$]")
 
 # 3) diagonal guide
 lims = [
-    min(y_ref.min(), y_pseudo.min(), y_raw.min()),
-    max(y_ref.max(), y_pseudo.max(), y_raw.max()),
+    min(y_pseudo_mean.min(), y_pseudo.min(), y_raw.min()),
+    max(y_pseudo_mean.max(), y_pseudo.max(), y_raw.max()),
 ]
 ax.plot(lims, lims, "k--", label="Ideal")
 
@@ -293,11 +321,11 @@ class T3Net(nn.Module):
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-patience, wait = 250, 0
+patience, wait = 500, 0
 num_epochs = 2000
-n_replicas = 100
+n_replicas = 20
 
-lambda_sum, lambda_pos = 100.0, 10.0
+lambda_sum, lambda_pos = 1000.0, 10.0
 
 
 fits = []  # accepted fits
@@ -314,13 +342,13 @@ for i in range(n_replicas):
 
     # 2) Train/validation split
     idx = np.arange(W_torch.size(0))
-    train_idx, val_idx = train_test_split(idx, test_size=0.2, random_state=base_seed + i)
+    train_idx, val_idx = train_test_split(idx, test_size=0.1, random_state=base_seed + i)
 
     # 3) Build & invert sub-covariances
     C_tr = C_yy[np.ix_(train_idx, train_idx)]
     C_val = C_yy[np.ix_(val_idx, val_idx)]
-    eps_tr = 1e-6 * np.mean(np.diag(C_tr))
-    eps_val = 1e-6 * np.mean(np.diag(C_val))
+    eps_tr = 1e-5 * np.mean(np.diag(C_tr))
+    eps_val = 1e-5 * np.mean(np.diag(C_val))
     C_tr += np.eye(len(train_idx)) * eps_tr
     C_val += np.eye(len(val_idx)) * eps_val
     Cinv_tr = torch.tensor(np.linalg.inv(C_tr), dtype=torch.float32).to(device)
@@ -328,11 +356,11 @@ for i in range(n_replicas):
 
     # thresholds
     chi2_tol = 1.5 * len(val_idx)
-    sum_tol = 0.5
+    sum_tol = 0.4
     neg_tol = 1e-5
 
     # 4) Initialize model & optimizer
-    model_rep = T3Net(n_hidden=100, n_layers=15, alpha=0.5, beta=5.0, dropout=0.2).to(device)
+    model_rep = T3Net(n_hidden=100, n_layers=20, alpha=0.5, beta=5.0, dropout=0.05).to(device)
     opt_rep = Adam(model_rep.parameters(), lr=1e-3, weight_decay=1e-4)
 
     # 5) Train/Val loop with early stopping on validation loss
@@ -399,6 +427,9 @@ for i in range(n_replicas):
         logger.warning(
             f"Replica {i} discard: χ²={chi2_val:.1f}, sum_dev={sum_dev:.2e}, neg_max={neg_max:.2e}",
         )
+        logger.warning(
+            f"χ² tolerance={chi2_tol:.1f}, sum_tol={sum_tol:.2e}, neg_tol={neg_tol:.2e}",
+        )
 
 # Convert accepted fits to array
 fits = np.array(fits)
@@ -440,32 +471,7 @@ plt.savefig(images_dir / "train_val_loss_last_accepted.png", dpi=300)
 plt.show()
 
 
-# %% ---- PDF Correlation Matrix Heatmap ----
-cov_pdf = np.cov(fits, rowvar=False)
-corr_pdf = cov_pdf / np.sqrt(np.outer(np.diag(cov_pdf), np.diag(cov_pdf)))
-plt.figure(figsize=(6, 5))
-plt.imshow(corr_pdf, origin="lower", aspect="auto", vmin=-1, vmax=1)
-plt.colorbar(label="Correlation")
-plt.xlabel("x-bin index")
-plt.ylabel("x-bin index")
-plt.title("PDF Correlation Matrix")
-plt.tight_layout()
-plt.show()
-# %% ---- Principal Components of PDF Uncertainty ----
-eigvals, eigvecs = np.linalg.eigh(cov_pdf)
-idx = np.argsort(eigvals)[::-1]
-eigvals, eigvecs = eigvals[idx], eigvecs[:, idx]
-
-# plot first 3 eigen-modes
-plt.figure(figsize=(6, 4))
-for j in range(3):
-    plt.plot(xgrid, eigvecs[:, j], label=f"PC{j + 1} ({eigvals[j]:.2e})")
-plt.xlabel(r"$x$")
-plt.ylabel("Eigenvector")
-plt.title("Leading Principal Components of PDF Covariance")
-plt.legend()
-plt.tight_layout()
-plt.show()
-
-
 # %%
+
+
+# Try training and not training, alpha and beta.
