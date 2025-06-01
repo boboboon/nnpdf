@@ -440,3 +440,4 @@ tags
 # Personal Git Ignore Folders
 images/*
 model_states/*
+training_results.csv
