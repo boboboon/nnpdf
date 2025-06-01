@@ -489,7 +489,7 @@ k_vector_contact = compute_k_vector(q2_vals, key="contact", M=1e4)
 
 # 9.3 Define fit-parameter template
 fit_params = {
-    "n_replicas": 2,
+    "n_replicas": 20,
     "n_hidden": 30,
     "n_layers": 3,
     "dropout": 0.2,
@@ -597,7 +597,7 @@ for sc in scenarios:
             **record,
             "use_bsm": use_bsm,
             "injection_c": inj_c,
-            "k_type": k_key if k_key is not None else "none",
+            "k_type": k_key if k_key is not None else "None",
             "use_real_data": use_real,
             "f_best": f_norm_array,  # array of length n_grid
         }
@@ -611,8 +611,9 @@ for sc in scenarios:
     results_df = pd.DataFrame(scenario_records)
     all_results.append(results_df)
 
-combined_df = pd.concat(all_results, ignore_index=True, sort=False)
+combined_df = pd.concat(all_results, ignore_index=True, sort=False).set_index("scenario")
 
+combined_df.to_csv("training_results.csv")
 
 # %%
 """PLOTTING RESULTS for T3_BSM_Comparison"""
