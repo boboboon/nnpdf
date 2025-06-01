@@ -8,6 +8,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import lhapdf
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
@@ -552,9 +553,13 @@ for mode in data_modes:
                     "use_real_data": use_real,
                 },
             )
-
-# 9.6 Run each scenario, collect results
+# %%
+# 9.6 Run each scenario, collect results (including f_best arrays)
 all_results = []
+
+# We'll also keep a dictionary of lists of f_best arrays, keyed by scenario,
+# so it's easy to extract stacks of fits for plotting.
+scenario_fits: dict[str, list[np.ndarray]] = {sc["name"]: [] for sc in scenarios}
 
 for sc in scenarios:
     name = sc["name"]
@@ -568,9 +573,7 @@ for sc in scenarios:
     scenario_records = []
 
     for i in range(fit_params["n_replicas"]):
-        logger.info(
-            f"  Replica {i + 1}/{fit_params['n_replicas']} for scenario {name}",
-        )
+        logger.info(f"  Replica {i + 1}/{fit_params['n_replicas']} for scenario {name}")
 
         record, f_norm_array = train_one_replica(
             i,
@@ -588,6 +591,7 @@ for sc in scenarios:
             use_real,
         )
 
+        # Build the final record dictionary, adding f_norm_array under "f_best"
         record_final = {
             "scenario": name,
             **record,
@@ -595,18 +599,168 @@ for sc in scenarios:
             "injection_c": inj_c,
             "k_type": k_key if k_key is not None else "none",
             "use_real_data": use_real,
+            "f_best": f_norm_array,  # array of length n_grid
         }
         scenario_records.append(record_final)
+        scenario_fits[name].append(f_norm_array)
 
     logger.success(
-        f"Finished scenario “{name}”: kept {len(scenario_records)} replicas out of {fit_params['n_replicas']}",  # noqa: E501
+        f"Finished scenario “{name}”: kept {len(scenario_records)}",
     )
 
-    logger.info(
-        f"[{name}] Kept {len(scenario_records)} out of {fit_params['n_replicas']} replicas.\n",
-    )
     results_df = pd.DataFrame(scenario_records)
     all_results.append(results_df)
 
 combined_df = pd.concat(all_results, ignore_index=True, sort=False)
+
+
 # %%
+"""PLOTTING RESULTS for T3_BSM_Comparison"""
+
+# Now combined_df has columns including:
+#   scenario, replica, chi2, chi2_perpt, alpha, beta, c, use_bsm, injection_c, k_type,
+#   use_real_data, f_best
+# And scenario_fits maps each scenario name to a list of f_best arrays (kept replicas).
+
+# -------------------------------
+# 1) Ensemble PDF Comparison
+# -------------------------------
+# Choose two scenarios to compare (e.g., base_closure vs bsm_quadratic_closure_inj_0p01)
+sc1 = "base_closure"
+sc2 = "bsm_quadratic_closure_inj_0p01"
+
+fits1 = np.stack(scenario_fits[sc1])  # shape (n_kept1, n_grid)
+fits2 = np.stack(scenario_fits[sc2])  # shape (n_kept2, n_grid)
+
+mean1, std1 = fits1.mean(axis=0), fits1.std(axis=0)
+mean2, std2 = fits2.mean(axis=0), fits2.std(axis=0)
+
+plt.figure(figsize=(7, 5))
+plt.fill_between(
+    xgrid,
+    mean1 - std1,
+    mean1 + std1,
+    alpha=0.3,
+    label=f"{sc1} envelope",
+)
+plt.plot(xgrid, mean1, "-", label=f"{sc1} mean")
+
+plt.fill_between(
+    xgrid,
+    mean2 - std2,
+    mean2 + std2,
+    alpha=0.3,
+    color="C1",
+    label=f"{sc2} envelope",
+)
+plt.plot(xgrid, mean2, "-", color="C1", label=f"{sc2} mean")
+
+plt.xscale("log")
+plt.xlabel(r"$x$")
+plt.ylabel(r"$x\,T_3(x)$")
+plt.title("Ensemble Comparison: " + sc1 + " vs. " + sc2)
+plt.legend(fontsize="small")
+plt.tight_layout()
+plt.show()
+
+# -------------------------------
+# 2) alpha and beta Histograms
+# -------------------------------
+df1 = combined_df.query("scenario == @sc1")
+df2 = combined_df.query("scenario == @sc2")
+
+plt.figure(figsize=(10, 4))
+plt.subplot(1, 2, 1)
+plt.hist(df1["alpha"], bins="auto", alpha=0.6, edgecolor="black", label=sc1)
+plt.hist(df2["alpha"], bins="auto", alpha=0.6, edgecolor="black", label=sc2)
+plt.xlabel(r"$\alpha$")
+plt.ylabel("Replicas")
+plt.title(r"Distribution of $\alpha$")
+plt.legend()
+
+plt.subplot(1, 2, 2)
+plt.hist(df1["beta"], bins="auto", alpha=0.6, edgecolor="black", label=sc1)
+plt.hist(df2["beta"], bins="auto", alpha=0.6, edgecolor="black", label=sc2)
+plt.xlabel(r"$\beta$")
+plt.ylabel("Replicas")
+plt.title(r"Distribution of $\beta$")
+plt.legend()
+
+plt.tight_layout()
+plt.show()
+
+# -------------------------------
+# 3) alpha vs beta Scatter
+# -------------------------------
+plt.figure(figsize=(5, 5))
+plt.scatter(df1["alpha"], df1["beta"], alpha=0.7, label=sc1)
+plt.scatter(df2["alpha"], df2["beta"], alpha=0.7, label=sc2)
+plt.xlabel(r"$\alpha$")
+plt.ylabel(r"$\beta$")
+plt.title(r"Scatter: $\alpha$ vs $\beta$")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# -------------------------------
+# 4) χ²/pt Histograms (Kept Replicas)
+# -------------------------------
+chi2pt1_kept = df1["chi2_perpt"].to_numpy()
+chi2pt2_kept = df2["chi2_perpt"].to_numpy()
+
+plt.figure(figsize=(6, 4))
+plt.hist(chi2pt1_kept, bins=20, alpha=0.5, edgecolor="black", label=f"{sc1} kept")
+plt.hist(chi2pt2_kept, bins=20, alpha=0.5, edgecolor="black", label=f"{sc2} kept")
+plt.axvline(0.8, color="red", linestyle="--")
+plt.axvline(1.2, color="red", linestyle="--")
+plt.xlabel(r"$\chi^2/\mathrm{pt}$")
+plt.ylabel("Replicas")
+plt.title(r"Kept Replicas: $\frac{\chi^2}{pt}$ Distribution")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# -------------------------------
+# 5) BSM Coefficient c Histogram
+# -------------------------------
+if "bsm" in sc2:
+    plt.figure(figsize=(6, 4))
+    plt.hist(df2["c"], bins="auto", alpha=0.7, edgecolor="black")
+    plt.axvline(0.0, color="red", linestyle="--", label="c=0")
+    mean_c = df2["c"].mean()
+    std_c = df2["c"].std()
+    plt.axvline(mean_c, color="C1", linestyle="-", label=f"mean={mean_c:.3f}")
+    plt.fill_betweenx(
+        [0, plt.gca().get_ylim()[1]],
+        mean_c - std_c,
+        mean_c + std_c,
+        color="C1",
+        alpha=0.2,
+        label=rf"±1$\sigma$={std_c:.3f}",
+    )
+    plt.xlabel(r"BSM parameter $c$")
+    plt.ylabel("Replicas")
+    plt.title(f"Histogram of $c$ for {sc2}")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+# -------------------------------
+# 6) First Moment <x> Comparison
+# -------------------------------
+mom1 = np.array([np.trapz(xgrid * (f / xgrid), xgrid) for f in fits1])  # noqa: NPY201
+mom2 = np.array([np.trapz(xgrid * (f / xgrid), xgrid) for f in fits2])  # noqa: NPY201
+
+plt.figure(figsize=(6, 4))
+plt.hist(mom1, bins=10, alpha=0.6, edgecolor="black", label=sc1)
+plt.hist(mom2, bins=10, alpha=0.6, edgecolor="black", label=sc2)
+plt.xlabel(r"$\langle x \rangle_{T_3}$")
+plt.ylabel("Replicas")
+plt.title("First Moment Comparison")
+plt.legend()
+plt.tight_layout()
+plt.show()
+# %%
+# Include Plots from Previous
+# Make plots nicely from big data frame, also fix the names ...
+# Actually, saving models may not be the move, we seem to be drifting more than I remembered.
