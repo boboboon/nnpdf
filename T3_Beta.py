@@ -311,7 +311,7 @@ class T3Net(nn.Module):
 
 n_data = W.shape[0]
 n_grid = xgrid.shape[0]
-n_replicas = 10
+n_replicas = 2
 
 # Hyperparameters
 
@@ -320,7 +320,6 @@ n_layers = 3
 dropout = 0.2
 lr = 1e-3
 weight_decay = 1e-4
-lambda_smooth = 1e-4
 patience = 1000
 num_epochs = 5000
 
@@ -331,7 +330,7 @@ W_torch = torch.tensor(W, dtype=torch.float32, device=device)  # (n_data, n_grid
 x_torch = torch.tensor(xgrid, dtype=torch.float32).unsqueeze(1).to(device)  # (n_grid,1)
 wgt_torch = torch.tensor(weights, dtype=torch.float32, device=device)  # (n_grid,)
 
-for lambda_smooth in [0, 1e-2]:
+for lambda_smooth in [0, 1e-1, 1e-2]:
     for replica in range(n_replicas):
         torch.manual_seed(replica * 1234)
 
@@ -347,8 +346,16 @@ for lambda_smooth in [0, 1e-2]:
         Cinv_val = torch.tensor(np.linalg.inv(c_val), dtype=torch.float32, device=device)
 
         replica_rng = np.random.default_rng(seed=replica * 451)
-        y_replica = rng.multivariate_normal(y_real, c_yy)
-        y_torch = torch.tensor(y_replica, dtype=torch.float32, device=device)
+
+        noise = replica_rng.multivariate_normal(mean=np.zeros(len(y_theory)), cov=c_yy)
+        y_pseudo_replica = y_theory + noise
+
+        # We can pick one of these inputs
+        y_real_replica = rng.multivariate_normal(y_real, c_yy)
+        y_pseudo_replica = y_theory + noise
+        y_real_real = y_real
+
+        y_torch = torch.tensor(y_pseudo_replica, dtype=torch.float32, device=device)
 
         # 4) Initialize model and optimizer
         model = T3Net(
@@ -376,6 +383,7 @@ for lambda_smooth in [0, 1e-2]:
             # 5a) Forward pass → compute raw = x·t₃_unc(x)
             f_raw = model(x_torch).squeeze()  # (n_grid,)
             t3_unnorm = f_raw / x_torch.squeeze()  # t₃_unc(x), (n_grid,)
+            #! I think this is still just trapz, we should be certain though  # noqa: E501, EXE001, EXE003, EXE005
             integral = torch.dot(wgt_torch, t3_unnorm)  # ∫ t₃_unc(x) dx
             norm_factor = 1.0 / integral
             f_norm = norm_factor * f_raw  # x·t₃(x), normalized
@@ -466,11 +474,10 @@ df_results.to_csv("training_results.csv")
 # %%
 # 10. PLOT Mean ±1sigma envelope of x·t₃(x) across replicas
 # ------------------------------------------------------------------------------
-# — Before the loop, compute the normalized “truth” exactly once:
-wgt_np = weights.cpu().numpy()  # (n_grid,)
-f_raw_true = xgrid * t3_true  # raw = x·t3_true(x)
-integral_true = np.dot(wgt_np, t3_true)  # ∑ w_i·t3_true[i]
-f_norm_true = f_raw_true / integral_true  # normalized x·t3_true(x)
+
+t3_unnorm = t3_true / xgrid
+I_truth = np.trapz(t3_unnorm, xgrid)  # noqa: NPY201
+t3_norm = t3_true * (1.0 / I_truth)
 
 # Now build the 3x1 figure
 lambdas = sorted(df_results["lambda"].unique())
@@ -499,7 +506,7 @@ for idx, lam in enumerate(lambdas):
     ax.plot(xgrid, mean_f, color="C0", linewidth=2, label=r"Mean $x\,t_{3}(x)$")
 
     # ——> Here is the corrected “truth” overlay:
-    ax.plot(xgrid, f_norm_true, color="k", linestyle="--", linewidth=1.5, label=r"NNPDF4.0 (truth)")
+    ax.plot(xgrid, t3_norm, color="k", linestyle="--", linewidth=1.5, label=r"NNPDF4.0 (truth)")
 
     # Compute and annotate χ²/pt
     chi_vals = subset["chi2_per_pt"].to_numpy()
