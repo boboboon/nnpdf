@@ -307,39 +307,87 @@ class T3Net(nn.Module):
 # 8. REAL-DATA TRAINING LOOP (no pseudo, no BSM, no extra functions)
 # ------------------------------------------------------------------------------
 
-# (Assumes W, c_yy, xgrid, weights, and y_real are already defined in the notebook.)
+# Configuration dict with three separate entries: one for each input type.
+# Each entry contains:
+#   - "name": a descriptive name for this fit
+#   - all training hyperparameters (same across entries here, but you could customize)
+#   - "input_key": which of the three y-selection lines to use
 
+config = {
+    "fit_real_replica": {
+        "name": "Real Replica Fit",
+        "input_key": "real_replica",
+        "n_hidden": 30,
+        "n_layers": 3,
+        "dropout": 0.2,
+        "lr": 1e-3,
+        "weight_decay": 1e-4,
+        "patience": 1000,
+        "num_epochs": 5000,
+        "n_replicas": 10,
+    },
+    "fit_pseudo_replica": {
+        "name": "Pseudo Replica Fit",
+        "input_key": "pseudo_replica",
+        "n_hidden": 30,
+        "n_layers": 3,
+        "dropout": 0.2,
+        "lr": 1e-3,
+        "weight_decay": 1e-4,
+        "patience": 1000,
+        "num_epochs": 5000,
+        "n_replicas": 10,
+    },
+    "fit_real_real": {
+        "name": "Real Fit",
+        "input_key": "real_real",
+        "n_hidden": 30,
+        "n_layers": 3,
+        "dropout": 0.2,
+        "lr": 1e-3,
+        "weight_decay": 1e-4,
+        "patience": 1000,
+        "num_epochs": 5000,
+        "n_replicas": 10,
+    },
+}
+
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Convert fixed arrays to torch once:
 n_data = W.shape[0]
 n_grid = xgrid.shape[0]
-n_replicas = 2
-
-# Hyperparameters
-
-n_hidden = 30
-n_layers = 3
-dropout = 0.2
-lr = 1e-3
-weight_decay = 1e-4
-patience = 1000
-num_epochs = 5000
-
-
-results_list = []
 
 W_torch = torch.tensor(W, dtype=torch.float32, device=device)  # (n_data, n_grid)
-x_torch = torch.tensor(xgrid, dtype=torch.float32).unsqueeze(1).to(device)  # (n_grid,1)
+x_torch = torch.tensor(xgrid, dtype=torch.float32).unsqueeze(1).to(device)  # (n_grid, 1)
 wgt_torch = torch.tensor(weights, dtype=torch.float32, device=device)  # (n_grid,)
 
-for lambda_smooth in [0, 1e-1, 1e-2]:
+# ==============================================================================
+# 2. OUTER LOOP OVER CONFIG ENTRIES
+# ==============================================================================
+
+all_results = []  # will collect dicts for every (config_name, replica)
+
+for cfg_name, cfg in config.items():
+    input_key = cfg["input_key"]
+    n_hidden = cfg["n_hidden"]
+    n_layers = cfg["n_layers"]
+    dropout = cfg["dropout"]
+    lr = cfg["lr"]
+    weight_decay = cfg["weight_decay"]
+    patience = cfg["patience"]
+    num_epochs = cfg["num_epochs"]
+    n_replicas = cfg["n_replicas"]
+
     for replica in range(n_replicas):
         torch.manual_seed(replica * 1234)
 
-        # 1) Split indices into 90% train / 10% validation
+        # 2.1) Split indices into train/val
         idx_all = np.arange(n_data)
         train_idx, val_idx = train_test_split(idx_all, test_size=0.2, random_state=replica * 1000)
 
-        # 2) Build cov-submatrix inverses for train and validation
-        #    (Extract C_tr and C_val from c_yy and invert them)
+        # 2.2) Build covariance inverses for train and val
         c_tr = c_yy[np.ix_(train_idx, train_idx)]
         c_val = c_yy[np.ix_(val_idx, val_idx)]
         Cinv_tr = torch.tensor(np.linalg.inv(c_tr), dtype=torch.float32, device=device)
@@ -347,17 +395,24 @@ for lambda_smooth in [0, 1e-1, 1e-2]:
 
         replica_rng = np.random.default_rng(seed=replica * 451)
 
-        noise = replica_rng.multivariate_normal(mean=np.zeros(len(y_theory)), cov=c_yy)
-        y_pseudo_replica = y_theory + noise
+        # 2.3) Prepare the three possible y-inputs; select based on input_key
+        y_real_replica = replica_rng.multivariate_normal(y_real, c_yy)
+        y_pseudo_replica = replica_rng.multivariate_normal(y_theory, c_yy)
+        y_real_real = y_real.copy()
 
-        # We can pick one of these inputs
-        y_real_replica = rng.multivariate_normal(y_real, c_yy)
-        y_pseudo_replica = y_theory + noise
-        y_real_real = y_real
+        if input_key == "real_replica":
+            y_select = y_real_replica
+        elif input_key == "pseudo_replica":
+            y_select = y_pseudo_replica
+        elif input_key == "real_real":
+            y_select = y_real_real
+        else:
+            msg = f"Unknown input_key: {input_key}"
+            raise ValueError(msg)
 
-        y_torch = torch.tensor(y_pseudo_replica, dtype=torch.float32, device=device)
+        y_torch = torch.tensor(y_select, dtype=torch.float32, device=device)
 
-        # 4) Initialize model and optimizer
+        # 2.4) Initialize model and optimizer
         model = T3Net(
             n_hidden=n_hidden,
             n_layers=n_layers,
@@ -375,37 +430,29 @@ for lambda_smooth in [0, 1e-1, 1e-2]:
         best_val_loss = float("inf")
         wait_counter = 0
 
-        # 5) Epoch loop
+        # 2.5) Epoch loop
         for epoch in range(1, num_epochs + 1):
             model.train()
             optimizer.zero_grad()
 
-            # 5a) Forward pass → compute raw = x·t₃_unc(x)
+            # 2.5a) Forward → raw (x · t3_unc(x))
             f_raw = model(x_torch).squeeze()  # (n_grid,)
-            t3_unnorm = f_raw / x_torch.squeeze()  # t₃_unc(x), (n_grid,)
-            #! I think this is still just trapz, we should be certain though  # noqa: E501, EXE001, EXE003, EXE005
-            integral = torch.dot(wgt_torch, t3_unnorm)  # ∫ t₃_unc(x) dx
+            t3_unnorm = f_raw / x_torch.squeeze()  # t3_unc(x)
+            integral = torch.dot(wgt_torch, t3_unnorm)
             norm_factor = 1.0 / integral
-            f_norm = norm_factor * f_raw  # x·t₃(x), normalized
+            f_norm = norm_factor * f_raw  # x · t3(x), normalized
 
-            # 5b) Convolution → y_pred = W · [x·t₃(x)]
+            # 2.5b) Convolution → y_pred = W · [x·t3(x)]
             y_pred = W_torch.matmul(f_norm)  # (n_data,)
 
-            # 5c) χ² loss on train subset
-            resid_tr = y_pred[train_idx] - y_torch[train_idx]  # (n_train,)
-            loss_chi2 = resid_tr @ (Cinv_tr.matmul(resid_tr))  # scalar
-
-            # 5d) Smoothness penalty: ∥d²t₃_unc/dx²∥² (second-derivative on grid)
-            dx_vals = (x_torch[1:] - x_torch[:-1]).squeeze()  # (n_grid-1,)
-            d2 = (t3_unnorm[:-2] - 2 * t3_unnorm[1:-1] + t3_unnorm[2:]) / (dx_vals[:-1] ** 2)
-            loss_smooth = torch.sum(d2.pow(2))  # scalar
-
-            # 5e) Total loss = χ² + lambda smooth x smoothness
-            loss_total = loss_chi2 + lambda_smooth * loss_smooth
+            # 2.5c) χ² loss on train subset
+            resid_tr = y_pred[train_idx] - y_torch[train_idx]
+            loss_chi2 = resid_tr @ (Cinv_tr.matmul(resid_tr))
+            loss_total = loss_chi2
             loss_total.backward()
             optimizer.step()
 
-            # 5f) Validation pass (compute χ² on val subset)
+            # 2.5d) Validation pass
             model.eval()
             with torch.no_grad():
                 f_raw_val = model(x_torch).squeeze()
@@ -413,15 +460,14 @@ for lambda_smooth in [0, 1e-1, 1e-2]:
                 integral_val = torch.dot(wgt_torch, t3_unnorm_val.float())
                 norm_val = 1.0 / integral_val
                 f_norm_val = norm_val * f_raw_val
-                y_pred_val = W_torch[val_idx].matmul(f_norm_val)  # (n_val,)
-                resid_val = y_pred_val - y_torch[val_idx]  # (n_val,)
-                loss_val = resid_val @ (Cinv_val.matmul(resid_val))  # scalar
+                y_pred_val = W_torch[val_idx].matmul(f_norm_val)
+                resid_val = y_pred_val - y_torch[val_idx]
+                loss_val = resid_val @ (Cinv_val.matmul(resid_val))
 
-            # 5g) Early stopping & checkpointing in memory
+            # 2.5e) Early stopping
             if loss_val.item() < best_val_loss:
                 best_val_loss = loss_val.item()
                 wait_counter = 0
-                # Save best-state_dict in memory
                 best_state_dict = {k: v.clone() for k, v in model.state_dict().items()}
             else:
                 wait_counter += 1
@@ -431,10 +477,10 @@ for lambda_smooth in [0, 1e-1, 1e-2]:
             if epoch % 200 == 0:
                 n_val = val_idx.shape[0]
                 logger.info(
-                    f"Replica {replica} | Epoch {epoch:4d} | val χ²/n = {(loss_val / n_val).item():.4f}",  # noqa: E501
+                    f"{cfg_name} | Replica {replica} | Epoch {epoch:4d} | val χ²/n = {(loss_val / n_val).item():.4f}",  # noqa: E501
                 )
 
-        # 6) After training, reload best state and compute final metrics on val set
+        # 2.6) After training → reload best state, compute final metrics
         model.load_state_dict(best_state_dict)
         model.eval()
         with torch.no_grad():
@@ -443,72 +489,91 @@ for lambda_smooth in [0, 1e-1, 1e-2]:
             integral_best = torch.dot(wgt_torch, t3_unnorm_best.float())
             norm_best = 1.0 / integral_best
             f_norm_best = norm_best * f_raw_best  # (n_grid,)
-            y_pred_best = W_torch[val_idx].matmul(f_norm_best)  # (n_val,)
+            y_pred_best = W_torch[val_idx].matmul(f_norm_best)
             resid_v = y_pred_best - y_torch[val_idx]
             chi2_val_final = float(resid_v @ (Cinv_val.matmul(resid_v)))
             chi2_per_pt = chi2_val_final / float(val_idx.shape[0])
 
-        # 7) Extract learned alpha, beta
+        # 2.7) Extract learned alpha, beta
         alpha_val = float(torch.exp(model.logalpha).item())
         beta_val = float(torch.exp(model.logbeta).item())
 
-        # 8) Store results for this replica
-        results_list.append(
+        # 2.8) Store this replica's results, including which config/input was used
+        all_results.append(
             {
+                "config_name": cfg_name,
+                "config_display": cfg["name"],
                 "replica": replica,
-                "lambda": lambda_smooth,
                 "chi2_val": chi2_val_final,
                 "chi2_per_pt": chi2_per_pt,
                 "alpha": alpha_val,
                 "beta": beta_val,
-                "f_norm_best": f_norm_best.cpu().numpy(),  # numpy array of length n_grid
+                "f_norm_best": f_norm_best.cpu().numpy(),
             },
         )
 
-# 9) Combine into a DataFrame and save
+# ==============================================================================
+# 3. COMBINE INTO A DATAFRAME AND SAVE
+# ==============================================================================
 
-df_results = pd.DataFrame(results_list).set_index("replica")
+df_results = pd.DataFrame(all_results).set_index(["config_name", "replica"])
 df_results.to_csv("training_results.csv")
 
 
-# %%
-# 10. PLOT Mean ±1sigma envelope of x·t₃(x) across replicas
-# ------------------------------------------------------------------------------
+# ==============================================================================
+# 4. PLOTTING: ±1sigma ENVELOPE FOR EACH INPUT TYPE
+# ==============================================================================
 
-t3_unnorm = t3_true / xgrid
-I_truth = np.trapz(t3_unnorm, xgrid)  # noqa: NPY201
-t3_norm = t3_true * (1.0 / I_truth)
+# Prepare the “truth” t3(x) curve, normalized exactly as before:
+t3_unnorm_truth = t3_true / xgrid
+I_truth = np.trapz(t3_unnorm_truth, xgrid)  # noqa: NPY201
+t3_norm_truth = t3_true * (1.0 / I_truth)
 
-# Now build the 3x1 figure
-lambdas = sorted(df_results["lambda"].unique())
-fig, axes = plt.subplots(nrows=len(lambdas), ncols=1, figsize=(6, 4 * len(lambdas)), sharex=True)
-if len(lambdas) == 1:
+# Unique list of config_keys in the order they appear:
+config_keys = list(config.keys())
+
+fig, axes = plt.subplots(
+    nrows=len(config_keys),
+    ncols=1,
+    figsize=(6, 4 * len(config_keys)),
+    sharex=True,
+)
+if len(config_keys) == 1:
     axes = [axes]
 
-for idx, lam in enumerate(lambdas):
+for idx, cfg_key in enumerate(config_keys):
     ax = axes[idx]
-    subset = df_results[df_results["lambda"] == lam]
-    all_f_norm = np.vstack(subset["f_norm_best"].values)  # (n_replicas, n_grid)
+    display_name = config[cfg_key]["name"]
+
+    subset = df_results.loc[cfg_key]  # this picks all replicas under that config
+    all_f_norm = np.vstack(subset["f_norm_best"].values)  # shape: (n_replicas, n_grid)
     mean_f = np.mean(all_f_norm, axis=0)
     std_f = np.std(all_f_norm, axis=0)
     avg_sigma = np.mean(std_f)
 
-    # ±1sigma envelope (shaded)
+    # ±1sigma shaded envelope
     ax.fill_between(
         xgrid,
         mean_f - std_f,
         mean_f + std_f,
         color="C0",
         alpha=0.3,
-        label=rf"±1$\sigma$ envelope ($\langle\sigma\rangle={avg_sigma:.3f}$)",
+        label=rf"±1$\sigma$ ($\langle\sigma\rangle={avg_sigma:.3f}$)",
     )
     # Mean learned x·t3(x)
     ax.plot(xgrid, mean_f, color="C0", linewidth=2, label=r"Mean $x\,t_{3}(x)$")
 
-    # ——> Here is the corrected “truth” overlay:
-    ax.plot(xgrid, t3_norm, color="k", linestyle="--", linewidth=1.5, label=r"NNPDF4.0 (truth)")
+    # Overlay the “truth”
+    ax.plot(
+        xgrid,
+        t3_norm_truth,
+        color="k",
+        linestyle="--",
+        linewidth=1.5,
+        label=r"NNPDF4.0 (truth)",
+    )
 
-    # Compute and annotate χ²/pt
+    # Compute and annotate χ²/pt for this config
     chi_vals = subset["chi2_per_pt"].to_numpy()
     mean_chi = np.mean(chi_vals)
     std_chi = np.std(chi_vals)
@@ -524,7 +589,7 @@ for idx, lam in enumerate(lambdas):
     )
 
     ax.set_ylabel(r"$x\,t_{3}(x)$", fontsize=12)
-    ax.set_title(rf"$\lambda = {lam}$", fontsize=14)
+    ax.set_title(display_name, fontsize=14)
     ax.grid(alpha=0.2)
     ax.legend(fontsize=10)
 
