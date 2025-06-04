@@ -14,6 +14,7 @@ import pandas as pd
 import torch
 import torch.nn.functional as F  # noqa: N812
 from loguru import logger
+from matplotlib.lines import Line2D
 from sklearn.model_selection import train_test_split
 from torch import nn
 from torch.optim import Adam
@@ -424,31 +425,72 @@ class T3Net(nn.Module):
         return pre * pos  # returns x · t₃_unc(x)
 
 
-# %%
-# NORMALISATION AND EXTRAPOLATION
+class T3NetWithC(nn.Module):
+    """Neural network for x·t₃(x) plus a single BSM parameter C."""
+
+    def __init__(
+        self,
+        n_hidden: int,
+        n_layers: int = 3,
+        init_alpha: float = 1.0,
+        init_beta: float = 3.0,
+        dropout: float = 0.2,
+    ) -> None:
+        """Init our T3Net with additional BSM C Param."""
+        super().__init__()
+        # 1) instantiate the original T3Net
+        self.base = T3Net(
+            n_hidden=n_hidden,
+            n_layers=n_layers,
+            init_alpha=init_alpha,
+            init_beta=init_beta,
+            dropout=dropout,
+        )
+        # 2) expose logalpha/logbeta so that `model.logalpha` still works
+        self.logalpha = self.base.logalpha
+        self.logbeta = self.base.logbeta
+
+        # 3) add a single learnable scalar C (initialized at 0)
+        self.C = nn.Parameter(torch.tensor(0.0))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Returns f_raw = x · t₃_unc(x) (shape = n_grid,).
+
+        The BSM correction factor (1 + C·K) is applied downstream in the training loop.
+        """
+        # simply delegate to the base network
+        return self.base(x).squeeze()  # shape = (n_grid,)
 
 
 # %%
-# ==============================================================================
-# TRAINING LOOP (no pseudo, no BSM, no extra functions)
-# ==============================================================================
-# Add "lambda_sr" to each config entry:
+# ─── 1) DEFINE BASE ANSATZ FUNCTIONS (NORMALIZED TO UNIT AMPLITUDE) ───
+q2_vals = merged_df["q2"].to_numpy()  # (n_data,)
+x_vals_data = merged_df["x"].to_numpy()  # (n_data,)
+Q2_min = q2_vals.min()
+
+# Raw (unnormalized) shapes
+K1_raw = (q2_vals - Q2_min) ** 2
+K2_raw = x_vals_data * (1.0 - x_vals_data) * (q2_vals - Q2_min)
+
+# Normalize so max(|K_raw|)=1
+K1_unit = K1_raw / np.max(np.abs(K1_raw))
+K2_unit = K2_raw / np.max(np.abs(K2_raw))
+
+# Convert to torch tensors
+K_dict = {
+    "ansatz1": torch.tensor(K1_unit, dtype=torch.float32, device=device),
+    "ansatz2": torch.tensor(K2_unit, dtype=torch.float32, device=device),
+    "noansatz": torch.zeros(len(q2_vals), dtype=torch.float32, device=device),
+}
+
+# ─── 2) DEFINE GRID OF “TRUE” C VALUES FOR SENSITIVITY SCAN ───
+C_trues = [0.001, 0.1, 1]
+
+# ─── 3) BUILD CONFIG DICTIONARY INCLUDING ORIGINAL FITS + SENSITIVITY SCANS ───
 config = {
-    "fit_pseudo_replica": {
-        "name": "Pseudo Replica Fit",
-        "input_key": "pseudo_replica",
-        "n_hidden": 30,
-        "n_layers": 3,
-        "dropout": 0.2,
-        "lr": 1e-3,
-        "weight_decay": 1e-4,
-        "patience": 500,
-        "num_epochs": 5000,
-        "n_replicas": 200,
-        "lambda_sr": 10000.0,  # quite large for pseudo-data
-    },
+    # Original fits (no BSM)
     "fit_real_real": {
-        "name": "Real Fit",
+        "name": "Real-Data Fit",
         "input_key": "real_real",
         "n_hidden": 30,
         "n_layers": 3,
@@ -457,27 +499,83 @@ config = {
         "weight_decay": 1e-4,
         "patience": 500,
         "num_epochs": 5000,
-        "n_replicas": 400,
-        "lambda_sr": 0.0,  # no sum-rule pull for real data (start with 0)
+        "n_replicas": 100,
+        "lambda_sr": 0.0,
+        "bsm": False,
+        "ansatz": None,
+        "C_true": 0.0,
+    },
+    "fit_pseudo_replica": {
+        "name": "Pseudo-Replica Fit",
+        "input_key": "pseudo_replica",
+        "n_hidden": 30,
+        "n_layers": 3,
+        "dropout": 0.2,
+        "lr": 1e-3,
+        "weight_decay": 1e-4,
+        "patience": 500,
+        "num_epochs": 5000,
+        "n_replicas": 100,
+        "lambda_sr": 10000.0,
+        "bsm": False,
+        "ansatz": None,
+        "C_true": 0.0,
+    },
+    "sens_noansatz_C0": {
+        "name": "Pseudo-Replica BSM (No Ansatz), $C_{true}=0e0$",
+        "input_key": "pseudo_replica",
+        "n_hidden": 30,
+        "n_layers": 3,
+        "dropout": 0.2,
+        "lr": 1e-3,
+        "weight_decay": 1e-4,
+        "patience": 500,
+        "num_epochs": 5000,
+        "n_replicas": 100,
+        "lambda_sr": 10000.0,
+        "bsm": True,
+        "ansatz": "noansatz",
+        "C_true": 0.0,
     },
 }
 
+for ansatz_name in ["ansatz1", "ansatz2"]:
+    for C_true in C_trues:
+        cfg_key = f"sens_{ansatz_name}_C{C_true:.0e}"
+        display = {
+            "ansatz1": "Sensitivity Scan 1 (Q²² shape)",
+            "ansatz2": "Sensitivity Scan 2 (x(1-x)Q² shape)",
+        }[ansatz_name]
+        cfg_name = f"{display}, $C_{{true}}$={C_true:.0e}"
+        config[cfg_key] = {
+            "name": cfg_name,
+            "input_key": "pseudo_replica",  # always pseudo-data for sensitivity scans
+            "n_hidden": 30,
+            "n_layers": 3,
+            "dropout": 0.2,
+            "lr": 1e-3,
+            "weight_decay": 1e-4,
+            "patience": 500,
+            "num_epochs": 5000,
+            "n_replicas": 100,
+            "lambda_sr": 10000.0,
+            "bsm": True,
+            "ansatz": ansatz_name,
+            "C_true": C_true,
+        }
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Convert fixed arrays to torch once:
+# ─── 4) PREPARE FIXED TENSORS FOR TRAINING ───
 n_data = W.shape[0]
 n_grid = xgrid.shape[0]
+W_torch = torch.tensor(W, dtype=torch.float32, device=device)
+x_torch = torch.tensor(xgrid, dtype=torch.float32).unsqueeze(1).to(device)
 
-W_torch = torch.tensor(W, dtype=torch.float32, device=device)  # (n_data, n_grid)
-x_torch = torch.tensor(xgrid, dtype=torch.float32).unsqueeze(1).to(device)  # (n_grid, 1)
+# Collect all results here
+all_results = []
 
-# ==============================================================================
-# 2. OUTER LOOP OVER CONFIG ENTRIES
-# ==============================================================================
-all_results = []  # will collect dicts for every (config_name, replica)
-
-for cfg_name, cfg in config.items():
+# ─── 5) OUTER LOOP OVER CONFIG ENTRIES ───
+for cfg_key, cfg in config.items():
     input_key = cfg["input_key"]
     n_hidden = cfg["n_hidden"]
     n_layers = cfg["n_layers"]
@@ -487,48 +585,55 @@ for cfg_name, cfg in config.items():
     patience = cfg["patience"]
     num_epochs = cfg["num_epochs"]
     n_replicas = cfg["n_replicas"]
-    lambda_sr = cfg["lambda_sr"]  # sum-rule weight
+    lambda_sr = cfg["lambda_sr"]
+    is_bsm = cfg["bsm"]
+    ansatz_name = cfg["ansatz"]
+    C_true = cfg["C_true"]
+    display_name = cfg["name"]
 
     for replica in range(n_replicas):
+        # ─── 5.a) Split train/validation indices ───
         torch.manual_seed(replica * 1234)
-
-        # 2.1) Split indices into train/val
         idx_all = np.arange(n_data)
-        train_idx, val_idx = train_test_split(
-            idx_all,
-            test_size=0.2,
-            random_state=replica * 1000,
-        )
+        train_idx, val_idx = train_test_split(idx_all, test_size=0.2, random_state=replica * 1000)
 
-        # 2.2) Build covariance inverses for train and val
+        # ─── 5.b) Prepare y-input (with or without BSM injection) ───
+        rng = np.random.default_rng(seed=replica * 451)
+        y_real_replica = rng.multivariate_normal(y_real, c_yy)
+        y_pseudo_replica = rng.multivariate_normal(y_theory, c_yy)
+
+        if is_bsm:
+            K_torch = K_dict[ansatz_name]
+            y_theory_bsm = (W @ t3_true) * (1.0 + C_true * K_torch.cpu().numpy())
+            y_select = rng.multivariate_normal(y_theory_bsm, c_yy)
+        else:
+            y_select = {"real_real": y_real.copy(), "pseudo_replica": y_pseudo_replica}[input_key]
+
+        y_torch = torch.tensor(y_select, dtype=torch.float32, device=device)
+
+        # ─── 5.c) Build covariance inverses for train & val ───
         c_tr = c_yy[np.ix_(train_idx, train_idx)]
         c_val = c_yy[np.ix_(val_idx, val_idx)]
         Cinv_tr = torch.tensor(np.linalg.inv(c_tr), dtype=torch.float32, device=device)
         Cinv_val = torch.tensor(np.linalg.inv(c_val), dtype=torch.float32, device=device)
 
-        replica_rng = np.random.default_rng(seed=replica * 451)
-
-        # 2.3) Prepare the three possible y-inputs; select based on input_key
-        y_real_replica = replica_rng.multivariate_normal(y_real, c_yy)
-        y_pseudo_replica = replica_rng.multivariate_normal(y_theory, c_yy)
-        y_real_real = y_real.copy()
-
-        input_dict = {
-            "real_replica": y_real_replica,
-            "pseudo_replica": y_pseudo_replica,
-            "real_real": y_real_real,
-        }
-        y_select = input_dict[input_key]
-        y_torch = torch.tensor(y_select, dtype=torch.float32, device=device)
-
-        # 2.4) Initialize model and optimizer
-        model = T3Net(
-            n_hidden=n_hidden,
-            n_layers=n_layers,
-            init_alpha=1.0,
-            init_beta=3.0,
-            dropout=dropout,
-        ).to(device)
+        # ─── 5.d) Initialize model & optimizer ───
+        if is_bsm:
+            model = T3NetWithC(
+                n_hidden=n_hidden,
+                n_layers=n_layers,
+                init_alpha=1.0,
+                init_beta=3.0,
+                dropout=dropout,
+            ).to(device)
+        else:
+            model = T3Net(
+                n_hidden=n_hidden,
+                n_layers=n_layers,
+                init_alpha=1.0,
+                init_beta=3.0,
+                dropout=dropout,
+            ).to(device)
 
         optimizer = Adam(
             model.parameters(),
@@ -538,164 +643,146 @@ for cfg_name, cfg in config.items():
 
         best_val_loss = float("inf")
         wait_counter = 0
+        best_state = {}
 
-        # 2.5) Epoch loop
+        # ─── 5.e) TRAINING LOOP ───
         for epoch in range(1, num_epochs + 1):
             model.train()
             optimizer.zero_grad()
 
-            # --------------------------------------------
-            # TRAINING PASS: χ² + sum-rule penalty
-            # --------------------------------------------
+            f_raw = model(x_torch).squeeze()  # (n_grid,)
+            y_pred_sm = W_torch.matmul(f_raw)  # (n_data,)
 
-            # (a) Raw network output: f_raw = x · T3_unc(x)
-            f_raw = model(x_torch).squeeze()  # shape = (n_grid,)
+            if is_bsm:
+                K_t = K_dict[ansatz_name]
+                y_pred = y_pred_sm * (1.0 + model.C * K_t)
+            else:
+                y_pred = y_pred_sm
 
-            # (b) Compute χ² on the training subset
-            y_pred = W_torch.matmul(f_raw)  # (n_data,)
-            resid_tr = y_pred[train_idx] - y_torch[train_idx]  # (n_train,)
-            loss_chi2 = resid_tr @ (Cinv_tr.matmul(resid_tr))  # scalar
+            resid_tr = y_pred[train_idx] - y_torch[train_idx]
+            loss_chi2 = resid_tr @ (Cinv_tr.matmul(resid_tr))
 
+            # Sum-rule penalty
             loss_sumrule = torch.tensor(0.0, device=device)
-
-            # (c) Sum-rule penalty (only if lambda_sr > 0)
             if lambda_sr > 0.0:
-                # Recover T3_unc(x_i) = [f_raw[i] / xgrid[i]]
-                # Note: x_torch.squeeze() is a tensor of shape (n_grid,)
-                t3_unc = f_raw / x_torch.squeeze()  # shape = (n_grid,)
-
-                # Torch's trapezoidal rule over [x_min, x_max]:
-                I_mid = torch.trapz(t3_unc, x_torch.squeeze())  # scalar tensor
-
-                # Penalize deviation from the reference integral:
-                #    t3_ref_int was computed once earlier as a float
+                t3_unc = f_raw / x_torch.squeeze()
+                I_mid = torch.trapz(t3_unc, x_torch.squeeze())
                 loss_sumrule = lambda_sr * (I_mid - float(t3_ref_int)) ** 2
 
-            # (d) Total loss = χ² + λ_sr * (sum-rule penalty)
             loss_total = loss_chi2 + loss_sumrule
             loss_total.backward()
             optimizer.step()
 
-            # --------------------------------------------
-            # VALIDATION PASS: plain χ² on held-out subset
-            # (no sum-rule penalty here)
-            # --------------------------------------------
+            # ─── Validation χ² (no sum-rule penalty) ───
             model.eval()
             with torch.no_grad():
-                f_raw_val = model(x_torch).squeeze()  # (n_grid,)
-                y_pred_val = W_torch[val_idx].matmul(f_raw_val)  # (n_val,)
-                resid_val = y_pred_val - y_torch[val_idx]  # (n_val,)
-                loss_val = resid_val @ (Cinv_val.matmul(resid_val))  # scalar
-                loss_val_per_pt = loss_val / float(len(val_idx))  # scalar
+                f_raw_val = model(x_torch).squeeze()
+                y_val_sm = W_torch[val_idx].matmul(f_raw_val)
 
-            # --------------------------------------------
-            # EARLY STOPPING CHECK on validation χ² (no penalty here)
-            # --------------------------------------------
+                y_val_pred = y_val_sm * (1.0 + model.C * K_t[val_idx]) if is_bsm else y_val_sm
+
+                resid_val = y_val_pred - y_torch[val_idx]
+                loss_val = resid_val @ (Cinv_val.matmul(resid_val))
+                val_chi2_pt = (loss_val / float(len(val_idx))).item()
+
+            # ─── Early stopping ───
             if loss_val.item() < best_val_loss:
                 best_val_loss = loss_val.item()
                 wait_counter = 0
-                best_state_dict = {k: v.clone() for k, v in model.state_dict().items()}
+                best_state = {k: v.clone() for k, v in model.state_dict().items()}
             else:
                 wait_counter += 1
                 if wait_counter >= patience:
                     break
 
-            # Optional logging every 200 epochs:
+            # ─── Logging every 200 epochs ───
             if epoch % 200 == 0:
-                n_val = len(val_idx)
-                logger.info(
-                    f"{cfg_name} | Replica {replica} | "
-                    f"Epoch {epoch:4d} | val χ²/pt = {(loss_val / n_val).item():.4f} ",
-                )
+                if is_bsm:
+                    logger.info(
+                        f"{cfg_key} | Replica {replica} | Epoch {epoch:4d} | "
+                        f"val χ²/pt = {val_chi2_pt:.4f} | C = {model.C.item():.3e}",
+                    )
+                else:
+                    logger.info(
+                        f"{cfg_key} | Replica {replica} | Epoch {epoch:4d} | "
+                        f"val χ²/pt = {val_chi2_pt:.4f}",
+                    )
 
-        # 2.6) After training → reload best state_dict, compute final metrics
-        model.load_state_dict(best_state_dict)
+        # ─── 5.f) Reload best state, compute final metrics on validation ───
+        model.load_state_dict(best_state)
         model.eval()
         with torch.no_grad():
-            f_raw_best = model(x_torch).squeeze()  # (n_grid,)
-            y_pred_best = W_torch[val_idx].matmul(f_raw_best)  # (n_val,)
-            resid_v = y_pred_best - y_torch[val_idx]  # (n_val,)
+            f_raw_best = model(x_torch).squeeze()
+            y_val_sm_best = W_torch[val_idx].matmul(f_raw_best)
+
+            if is_bsm:
+                y_val_pred_best = y_val_sm_best * (1.0 + model.C * K_t[val_idx])
+            else:
+                y_val_pred_best = y_val_sm_best
+
+            resid_v = y_val_pred_best - y_torch[val_idx]
             chi2_val_final = float(resid_v @ (Cinv_val.matmul(resid_v)))
-            chi2_per_pt = chi2_val_final / float(len(val_idx))
+            chi2_pt = chi2_val_final / float(len(val_idx))
 
-        # 2.7) Store results if χ²/pt falls in range
-        if 0.9 <= chi2_per_pt <= 1.1:
-            logger.success(f"Replica {replica}: χ²/pt = {chi2_per_pt:.3f}")
-            alpha_val = float(torch.exp(model.logalpha).item())
-            beta_val = float(torch.exp(model.logbeta).item())
+        alpha_val = float(torch.exp(model.logalpha).item())
+        beta_val = float(torch.exp(model.logbeta).item())
+        C_fit = float(model.C.item()) if is_bsm else float("nan")
 
-            all_results.append(
-                {
-                    "config_name": cfg_name,
-                    "config_display": cfg["name"],
-                    "replica": replica,
-                    "chi2_val": chi2_val_final,
-                    "chi2_per_pt": chi2_per_pt,
-                    "alpha": alpha_val,
-                    "beta": beta_val,
-                    "f_raw_best": f_raw_best.cpu().numpy(),
-                },
-            )
-        else:
-            logger.warning(f"Replica {replica}: χ²/pt = {chi2_per_pt:.3f}")
+        all_results.append(
+            {
+                "config_key": cfg_key,
+                "config_name": display_name,
+                "replica": replica,
+                "alpha": alpha_val,
+                "beta": beta_val,
+                "C_true": C_true,
+                "C_fit": C_fit,
+                "chi2_pt": chi2_pt,
+                "f_raw_best": f_raw_best,
+            },
+        )
 
-# ==============================================================================
-# 3. COMBINE INTO A DATAFRAME AND SAVE
-# ==============================================================================
-df_results = pd.DataFrame(all_results).set_index(["config_name", "replica"])
+# ─── 6) COMBINE INTO DATAFRAME AND SAVE ───
+df_results = pd.DataFrame(all_results)
 df_results.to_pickle("training_results.pkl")
 
-
 # %%
-# ==============================================================================
-# 4. PLOTTING: ±1sigma ENVELOPE FOR EACH INPUT TYPE
-# ==============================================================================
-df_results = pd.read_pickle("training_results.pkl")
-df_plot = df_results.reset_index()
+# ─── 7) LOAD FOR PLOTTING ───
+df_plot = pd.read_pickle("training_results.pkl").reset_index()
 
-groups = [
-    ("fit_pseudo_replica", "Pseudo-Replica Fit"),
-    ("fit_real_real", "Real-Data Fit"),
-]
+# ---------------------------------------------------------------------
+# 8a) PLOTTING: 1x2 COMPARISON — Real Data Fit vs. Pseudo-Data Fit
+# ---------------------------------------------------------------------
+fig, axes = plt.subplots(nrows=1, ncols=2, figsize=(12, 5), sharex=True, sharey=True)
+comparison_keys = ["fit_real_real", "fit_pseudo_replica"]
+comparison_map = {
+    "fit_real_real": axes[0],
+    "fit_pseudo_replica": axes[1],
+}
 
-# --- Figure 1: ±1sigma Envelope for x·t₃(x) ------------------------------
-
-fig, (ax_left, ax_right) = plt.subplots(
-    nrows=1,
-    ncols=2,
-    figsize=(12, 5),
-    sharex=True,
-    sharey=True,
-)
-axes = {"fit_pseudo_replica": ax_left, "fit_real_real": ax_right}
-
-for cfg_name, display_name in groups:
-    ax = axes[cfg_name]
-
-    # Filter to this configuration
-    subset = df_plot[df_plot["config_name"] == cfg_name]
+for cfg_key, ax in comparison_map.items():
+    display_name = config[cfg_key]["name"]
+    subset = df_plot[df_plot["config_key"] == cfg_key]
 
     # Stack all f_raw_best arrays (shape = (n_replicas, n_grid))
     all_f_raw = np.vstack(subset["f_raw_best"].values)
-
-    # Compute mean and std over replicas
-    mean_f = np.mean(all_f_raw, axis=0)  # shape = (n_grid,)
-    std_f = np.std(all_f_raw, axis=0)  # shape = (n_grid,)
+    mean_f = np.mean(all_f_raw, axis=0)
+    std_f = np.std(all_f_raw, axis=0)
 
     # Compute average sigma for annotation
     avg_sigma = np.mean(std_f)
 
-    # Plot ±1sigma band
+    # ±1sigma band
     ax.fill_between(
         xgrid,
         mean_f - std_f,
         mean_f + std_f,
         color="C0",
         alpha=0.3,
-        label=rf"$\pm\,\sigma$ (⟨$\sigma$⟩ = {avg_sigma:.3f})",
+        label=rf"$\pm\sigma$ (⟨$\sigma$⟩ = {avg_sigma:.3f})",
     )
 
-    # Plot mean x·t₃(x)
+    # Mean x·t₃(x)
     ax.plot(
         xgrid,
         mean_f,
@@ -714,8 +801,8 @@ for cfg_name, display_name in groups:
         label=r"NNPDF40 (truth)",
     )
 
-    # Annotate χ²/pt: mean ± std over replicas
-    chi_vals = subset["chi2_per_pt"].astype(float).to_numpy()
+    # Annotate ⟨χ²/pt⟩ ± std(χ²/pt)
+    chi_vals = subset["chi2_pt"].astype(float).to_numpy()
     mean_chi = np.mean(chi_vals)
     std_chi = np.std(chi_vals)
     ax.text(
@@ -729,7 +816,6 @@ for cfg_name, display_name in groups:
         bbox={"boxstyle": "round,pad=0.3", "facecolor": "white", "alpha": 0.7},
     )
 
-    # Formatting
     ax.set_title(display_name, fontsize=14)
     ax.set_xlabel(r"$x$", fontsize=12)
     ax.set_ylabel(r"$x\,t_{3}(x)$", fontsize=12)
@@ -738,64 +824,286 @@ for cfg_name, display_name in groups:
 
 plt.tight_layout()
 plt.show()
-
 # %%
-# --- Figure 2: alpha vs. beta Scatter ------------------------------
+# ---------------------------------------------------------------------
+# 8b) PLOTTING: 2x2 COMPARISON — Pseudo, No-Ansatz (C=0), Ansatz1 (smallest non-zero C),
+# Ansatz2 (smallest non-zero C)
+# ---------------------------------------------------------------------
+fig, axes = plt.subplots(nrows=2, ncols=2, figsize=(12, 10), sharex=True, sharey=True)
 
-# Prepare one figure/axis instead of two subplots
-fig, ax = plt.subplots(figsize=(7, 6))
+pseudo_map = {
+    "fit_pseudo_replica": axes[0, 0],  # Pure pseudo-data
+    "sens_noansatz_C0": axes[0, 1],  # BSM closure with no ansatz, C=0
+    # (Since we do not have ansatz1/ansatz2 at C=0 in the new config, use the smallest non-zero C
+    # case: C=1e-03)
+    "sens_ansatz1_C1e-03": axes[1, 0],  # Sensitivity Scan 1, C=1e-03
+    "sens_ansatz2_C1e-03": axes[1, 1],  # Sensitivity Scan 2, C=1e-03
+}
 
-# Define configs with a distinct marker for each
-plot_defs = [
-    ("fit_pseudo_replica", "Pseudo-Replica Fit", "o"),
-    ("fit_real_real", "Real-Data Fit", "s"),
-]
+for cfg_key, ax in pseudo_map.items():
+    display_name = config[cfg_key]["name"]
+    subset = df_plot[df_plot["config_key"] == cfg_key]
 
-# We'll collect all "distance from 1" values to establish a common vmin/vmax
-all_distances = []
-for cfg_name, _, _ in plot_defs:
-    subset = df_plot[df_plot["config_name"] == cfg_name]
-    chi_vals = subset["chi2_per_pt"].astype(float).to_numpy()
-    all_distances.append(np.abs(chi_vals - 1.0))
-all_distances = np.concatenate(all_distances)
-vmin = all_distances.min()
-vmax = all_distances.max()
+    # Stack all f_raw_best arrays
+    all_f_raw = np.vstack(subset["f_raw_best"].values)
+    mean_f = np.mean(all_f_raw, axis=0)
+    std_f = np.std(all_f_raw, axis=0)
 
-# Now plot each config on the same Axes
-for cfg_name, display_name, marker_style in plot_defs:
-    subset = df_plot[df_plot["config_name"] == cfg_name]
+    # Compute average sigma for annotation
+    avg_sigma = np.mean(std_f)
+
+    # ±1sigma band
+    ax.fill_between(
+        xgrid,
+        mean_f - std_f,
+        mean_f + std_f,
+        color="C0",
+        alpha=0.3,
+        label=rf"$\pm\sigma$ (⟨$\sigma$⟩ = {avg_sigma:.3f})",
+    )
+
+    # Mean x·t₃(x)
+    ax.plot(
+        xgrid,
+        mean_f,
+        color="C0",
+        linewidth=2,
+        label=r"Mean $x\,t_{3}(x)$",
+    )
+
+    # Overlay NNPDF40 “truth”
+    ax.plot(
+        xgrid,
+        t3_true,
+        color="k",
+        linestyle="--",
+        linewidth=1.5,
+        label=r"NNPDF40 (truth)",
+    )
+
+    # Annotate ⟨χ²/pt⟩ ± std(χ²/pt)
+    chi_vals = subset["chi2_pt"].astype(float).to_numpy()
+    mean_chi = np.mean(chi_vals)
+    std_chi = np.std(chi_vals)
+    ax.text(
+        0.95,
+        0.95,
+        rf"$\chi^2/\mathrm{{pt}} = {mean_chi:.2f}\,\pm\,{std_chi:.2f}$",
+        transform=ax.transAxes,
+        ha="right",
+        va="top",
+        fontsize=10,
+        bbox={"boxstyle": "round,pad=0.3", "facecolor": "white", "alpha": 0.7},
+    )
+
+    ax.set_title(display_name, fontsize=14)
+    ax.set_xlabel(r"$x$", fontsize=12)
+    ax.set_ylabel(r"$x\,t_{3}(x)$", fontsize=12)
+    ax.grid(alpha=0.2)
+    ax.legend(fontsize=10)
+
+plt.tight_layout()
+plt.show()
+# %%
+# ---------------------------------------------------------------------
+# 9) PLOTTING: alpha vs. beta SCATTER SPLIT INTO TWO SUBPLOTS
+#               LEFT = real, pseudo, no-ansatz (all C_true = 0)
+#               RIGHT = ansatz1 & ansatz2 (marker = ansatz, color = C_true, discrete legend)
+#               Both subplots share x- and y-axes for direct comparison
+# ---------------------------------------------------------------------
+
+
+fig, (ax_left, ax_right) = plt.subplots(ncols=2, figsize=(14, 6), sharex=True, sharey=True)
+
+# -----------------------
+# LEFT SUBPLOT (C_true = 0)
+# -----------------------
+left_markers = {
+    "fit_real_real": ("Real-Data Fit", "s"),
+    "fit_pseudo_replica": ("Pseudo-Replica Fit", "o"),
+    "sens_noansatz": ("BSM Closure (No Ansatz)", "d"),
+}
+
+for prefix, (label, mkr) in left_markers.items():
+    subset = df_plot[df_plot["config_key"].str.startswith(prefix)]
+    if subset.empty:
+        continue
 
     alphas = subset["alpha"].astype(float).to_numpy()
     betas = subset["beta"].astype(float).to_numpy()
-    chi_vals = subset["chi2_per_pt"].astype(float).to_numpy()
-    dist_from1 = np.abs(chi_vals - 1.0)
 
-    sc = ax.scatter(
+    ax_left.scatter(
         alphas,
         betas,
-        c=dist_from1,
-        cmap="viridis",
-        vmin=vmin,
-        vmax=vmax,
-        marker=marker_style,
+        marker=mkr,
         edgecolor="k",
         alpha=0.8,
-        label=display_name,
+        label=label,
         linewidth=0.5,
         s=50,
     )
 
-# Axes formatting
-ax.set_xlabel(r"$\alpha$", fontsize=12)
-ax.set_ylabel(r"$\beta$", fontsize=12)
-ax.set_title(r"$\alpha$ vs. $\beta$ Scatter", fontsize=14)
-ax.grid(alpha=0.2)
-ax.legend(title="Configuration")
+ax_left.set_xlabel(r"$\alpha$", fontsize=12)
+ax_left.set_ylabel(r"$\beta$", fontsize=12)
+ax_left.set_title("No BSM (all $C_{true}=0$)", fontsize=14)
+ax_left.grid(alpha=0.2)
+ax_left.legend(title="Configuration", loc="upper left")
 
-# Single colorbar for all points
-cbar = fig.colorbar(sc, ax=ax, pad=0.02)
-cbar.set_label(r"$\bigl|\chi^2/\mathrm{pt} - 1\bigr|$", fontsize=10)
+# ------------------------
+# RIGHT SUBPLOT (BSM Scan)
+# ------------------------
+C_trues = [0.001, 0.1, 1.0]
+# Assign one discrete color per C_true
+color_map = {
+    0.001: "C0",
+    0.1: "C1",
+    1.0: "C2",
+}
+# Marker by ansatz
+marker_map_ansatz = {
+    "ansatz1": "s",  # square
+    "ansatz2": "o",  # circle
+}
+
+# Plot each (ansatz, C_true) combination, but only label C_true once (when ansatz1)
+for ansatz_name, mkr in marker_map_ansatz.items():
+    for C_true in C_trues:
+        cfg_key = f"sens_{ansatz_name}_C{C_true:.0e}"
+        subset = df_plot[df_plot["config_key"] == cfg_key]
+        if subset.empty:
+            continue
+
+        alphas = subset["alpha"].astype(float).to_numpy()
+        betas = subset["beta"].astype(float).to_numpy()
+
+        # Only give a label for C_true on the ansatz1 pass so that each C_true appears once in the
+        # legend
+        label_ct = (f"$C_{{true}}$={C_true:.0e}") if ansatz_name == "ansatz1" else None
+
+        ax_right.scatter(
+            alphas,
+            betas,
+            marker=mkr,
+            color=color_map[C_true],
+            edgecolor="k",
+            alpha=0.8,
+            label=label_ct,
+            linewidth=0.5,
+            s=50,
+        )
+
+ax_right.set_xlabel(r"$\alpha$", fontsize=12)
+ax_right.set_title("BSM Sensitivity Scans", fontsize=14)
+ax_right.grid(alpha=0.2)
+
+# Create a separate legend for the marker-shape ⇒ ansatz mapping
+ansatz_handles = [
+    Line2D([0], [0], marker="s", color="gray", linestyle="", label="Ansatz 1", markeredgecolor="k"),
+    Line2D([0], [0], marker="o", color="gray", linestyle="", label="Ansatz 2", markeredgecolor="k"),
+]
+legend1 = ax_right.legend(handles=ansatz_handles, title="Ansatz", loc="upper left")
+ax_right.add_artist(legend1)
+
+# Create a second legend for C_true ⇒ color mapping
+ax_right.legend(title="$C_{true}$", loc="lower right")
 
 plt.tight_layout()
 plt.show()
+
+
+# %%
+# --- 10) PLOTTING: Raw C_fit Histograms with Mean, Std, and C_true Lines ---
+fig, axes = plt.subplots(
+    nrows=1,
+    ncols=len(C_trues),
+    figsize=(4 * len(C_trues), 4),
+    sharex=True,
+    sharey=True,
+)
+
+# Define colors for each ansatz
+ansatz_colors = {
+    "ansatz1": "C0",
+    "ansatz2": "C1",
+}
+
+for col_idx, C_true_val in enumerate(C_trues):
+    ax = axes[col_idx]
+    stats_texts = []
+    for ansatz_name in ["ansatz1", "ansatz2"]:
+        cfg_key = f"sens_{ansatz_name}_C{C_true_val:.0e}"
+        subset = df_plot[df_plot["config_key"] == cfg_key]
+        if subset.empty:
+            continue
+
+        C_vals = subset["C_fit"].to_numpy()
+        mean_i = C_vals.mean()
+        std_i = C_vals.std()
+
+        # Plot histogram of raw C_fit
+        ax.hist(
+            C_vals,
+            bins=30,
+            histtype="stepfilled",
+            alpha=0.5,
+            density=True,
+            color=ansatz_colors[ansatz_name],
+        )
+
+        # Draw vertical dashed line at the mean
+        ax.axvline(
+            mean_i,
+            color=ansatz_colors[ansatz_name],
+            linestyle="--",
+            linewidth=1.0,
+        )
+
+        # Prepare annotation text for this ansatz using LaTeX for mu and sigma
+        stats_texts.append(
+            f"{ansatz_name.capitalize()}: $\\mu={mean_i:.3f}$, $\\sigma={std_i:.3f}$",
+        )
+
+    # Draw vertical solid line at the injected C_true
+    ax.axvline(
+        C_true_val,
+        color="k",
+        linestyle="-",
+        linewidth=1.0,
+    )
+
+    ax.set_title(f"$C_{{true}} = {C_true_val:.0e}$", fontsize=12)
+    ax.set_xlabel(r"$C_{\rm fit}$", fontsize=12)
+    if col_idx == 0:
+        ax.set_ylabel("Density", fontsize=12)
+    ax.grid(alpha=0.2)
+
+    # Place mean and std annotation in upper right corner
+    ax.text(
+        0.95,
+        0.95,
+        "\n".join(stats_texts),
+        transform=ax.transAxes,
+        ha="right",
+        va="top",
+        fontsize=9,
+        bbox={"boxstyle": "round,pad=0.3", "facecolor": "white", "alpha": 0.7},
+    )
+
+
+legend_handles = [
+    Line2D([0], [0], color=ansatz_colors["ansatz1"], lw=4, label="Ansatz 1"),
+    Line2D([0], [0], color=ansatz_colors["ansatz2"], lw=4, label="Ansatz 2"),
+]
+fig.legend(
+    handles=legend_handles,
+    title="Ansatz",
+    loc="upper center",
+    ncol=2,
+    bbox_to_anchor=(0.5, 1.05),
+)
+
+plt.suptitle("Raw $C_{\\rm fit}$ Distributions with Mean, Std, and True Value", y=1.10, fontsize=14)
+plt.tight_layout()
+plt.show()
+
 # %%
