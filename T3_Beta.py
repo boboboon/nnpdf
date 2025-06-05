@@ -570,7 +570,7 @@ n_data = W.shape[0]
 n_grid = xgrid.shape[0]
 W_torch = torch.tensor(W, dtype=torch.float32, device=device)
 x_torch = torch.tensor(xgrid, dtype=torch.float32).unsqueeze(1).to(device)
-
+# %%
 # Collect all results here
 all_results = []
 
@@ -748,7 +748,15 @@ df_results.to_pickle("training_results.pkl")
 
 # %%
 # ─── 7) LOAD FOR PLOTTING ───
-df_plot = pd.read_pickle("training_results.pkl").reset_index()
+df_plot = (
+    pd.read_pickle("training_results.pkl")
+    .reset_index()
+    .loc[
+        lambda df: ~df["config_key"].isin(
+            ["sens_noansatz_C1e-03", "sens_noansatz_C1e-01", "sens_noansatz_C1e+00"],
+        )
+    ]
+).loc[lambda df: (df["chi2_pt"] < 1.1) & (df["chi2_pt"] > 0.9)]
 
 # ---------------------------------------------------------------------
 # 8a) PLOTTING: 1x2 COMPARISON — Real Data Fit vs. Pseudo-Data Fit
@@ -918,13 +926,20 @@ fig, (ax_left, ax_right) = plt.subplots(ncols=2, figsize=(14, 6), sharex=True, s
 # -----------------------
 # LEFT SUBPLOT (C_true = 0)
 # -----------------------
-left_markers = {
-    "fit_real_real": ("Real-Data Fit", "s"),
-    "fit_pseudo_replica": ("Pseudo-Replica Fit", "o"),
-    "sens_noansatz": ("BSM Closure (No Ansatz)", "d"),
+left_configs = {
+    "fit_real_real": "Real-Data Fit",
+    "fit_pseudo_replica": "Pseudo-Replica Fit",
+    "sens_noansatz": "BSM Closure (No Ansatz)",
+}
+# assign one distinct color per config_key prefix (using C3, C4, C5 so they differ from right
+# subplot)
+color_map_left = {
+    "fit_real_real": "C3",
+    "fit_pseudo_replica": "C4",
+    "sens_noansatz": "C5",
 }
 
-for prefix, (label, mkr) in left_markers.items():
+for prefix, label in left_configs.items():
     subset = df_plot[df_plot["config_key"].str.startswith(prefix)]
     if subset.empty:
         continue
@@ -935,7 +950,8 @@ for prefix, (label, mkr) in left_markers.items():
     ax_left.scatter(
         alphas,
         betas,
-        marker=mkr,
+        marker="o",
+        color=color_map_left[prefix],
         edgecolor="k",
         alpha=0.8,
         label=label,
@@ -953,7 +969,7 @@ ax_left.legend(title="Configuration", loc="upper left")
 # RIGHT SUBPLOT (BSM Scan)
 # ------------------------
 C_trues = [0.001, 0.1, 1.0]
-# Assign one discrete color per C_true
+# Assign one discrete color per C_true (using C0, C1, C2)
 color_map = {
     0.001: "C0",
     0.1: "C1",
@@ -1005,7 +1021,7 @@ legend1 = ax_right.legend(handles=ansatz_handles, title="Ansatz", loc="upper lef
 ax_right.add_artist(legend1)
 
 # Create a second legend for C_true ⇒ color mapping
-ax_right.legend(title="$C_{true}$", loc="lower right")
+ax_right.legend(title="$C_{true}$", loc="lower left")
 
 plt.tight_layout()
 plt.show()
